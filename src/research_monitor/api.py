@@ -8,7 +8,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from fastapi import BackgroundTasks, Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
@@ -27,7 +27,7 @@ from .database import Database, get_database
 from .models import Artifact
 from .mutations import operation_integrity_error
 from .proposals import AppService
-from .preview import render_markdown_document
+from .preview import SafeOpenError, render_markdown_document
 from .schemas import (
     LayoutMutationEnvelope, MutationEnvelope, MutationUndo, ProjectCreate, ProposalApply,
     ProposalEnvelope, ProposalReject, ProposalRevision,
@@ -43,6 +43,17 @@ SECURITY_HEADERS = {
     "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
     "Cross-Origin-Opener-Policy": "same-origin",
 }
+
+
+def _artifact_content_disposition(name: str) -> str:
+    fallback = "".join(
+        character
+        if 32 <= ord(character) < 127 and character not in {'"', "\\"}
+        else "_"
+        for character in name
+    ).strip() or "artifact"
+    encoded = quote(name, safe="")
+    return f"inline; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
 
 
 class ServerStopRequest(BaseModel):
@@ -548,8 +559,22 @@ def create_app(
     @app.get("/api/v1/artifacts/{artifact_id}/preview")
     def artifact_preview(artifact_id: str, session: Session = SessionDep) -> Response:
         opened = service.artifact_preview(session, artifact_id)
-        safe_name = opened.name.replace(chr(34), "").replace("\r", "").replace("\n", "")
-        headers = {"Content-Disposition": f'inline; filename="{safe_name}"', "Cache-Control": "no-store"}
+        try:
+            content = opened.read_all()
+        except SafeOpenError as exc:
+            raise DomainError(exc.status_code, exc.code, exc.message) from exc
+        except OSError as exc:
+            opened.close()
+            raise DomainError(
+                404,
+                "artifact_changed",
+                "Artifact changed before it could be read",
+            ) from exc
+
+        headers = {
+            "Content-Disposition": _artifact_content_disposition(opened.name),
+            "Cache-Control": "no-store",
+        }
         if opened.mode in {"text", "pdf", "markdown"}:
             # Safe previews are embedded in a sandboxed same-origin iframe.  The
             # application-wide frame denial would otherwise make text previews
@@ -560,15 +585,13 @@ def create_app(
             )
             headers["X-Frame-Options"] = "SAMEORIGIN"
         if opened.mode == "markdown":
-            try:
-                source = opened.read_all().decode("utf-8", errors="replace")
-            except OSError as exc:
-                opened.close()
-                raise DomainError(404, "artifact_changed", "Artifact changed before it could be read") from exc
+            source = content.decode("utf-8", errors="replace")
             return HTMLResponse(render_markdown_document(source), headers=headers)
-        headers["Content-Length"] = str(opened.size_bytes)
-        return StreamingResponse(
-            opened.iter_bytes(), media_type=opened.media_type, headers=headers,
+        headers["Content-Length"] = str(len(content))
+        return Response(
+            content=content,
+            media_type=opened.media_type,
+            headers=headers,
         )
 
     @app.get("/api/v1/events")

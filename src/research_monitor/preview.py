@@ -30,26 +30,82 @@ class OpenedArtifact:
     mode: str = "text"
 
     def close(self) -> None:
-        if self.fd >= 0:
-            os.close(self.fd)
-            self.fd = -1
+        descriptor = self.fd
+        self.fd = -1
+        if descriptor >= 0:
+            os.close(descriptor)
 
     def read_all(self) -> bytes:
         try:
             with os.fdopen(self.fd, "rb", closefd=True) as handle:
                 self.fd = -1
-                return handle.read()
+                data = handle.read(self.size_bytes)
+                if len(data) != self.size_bytes:
+                    raise SafeOpenError(
+                        409,
+                        "artifact_changed",
+                        "Artifact was shortened after preview validation",
+                    )
+                return data
         finally:
             self.close()
 
     def iter_bytes(self, chunk_size: int = 64 * 1024) -> Iterator[bytes]:
-        try:
-            with os.fdopen(self.fd, "rb", closefd=True) as handle:
-                self.fd = -1
-                while chunk := handle.read(chunk_size):
-                    yield chunk
-        finally:
+        if chunk_size <= 0:
             self.close()
+            raise ValueError("chunk_size must be positive")
+        return _OpenedArtifactIterator(self, chunk_size)
+
+
+class _OpenedArtifactIterator:
+    """Own one opened artifact descriptor until exhaustion or explicit close."""
+
+    def __init__(self, opened: OpenedArtifact, chunk_size: int) -> None:
+        self._opened = opened
+        self._chunk_size = chunk_size
+        self._remaining = opened.size_bytes
+        self._closed = False
+
+    def __iter__(self) -> _OpenedArtifactIterator:
+        return self
+
+    def __next__(self) -> bytes:
+        if self._closed:
+            raise StopIteration
+        if self._remaining == 0:
+            self.close()
+            raise StopIteration
+        try:
+            chunk = os.read(
+                self._opened.fd,
+                min(self._chunk_size, self._remaining),
+            )
+        except OSError:
+            self.close()
+            raise
+        if not chunk:
+            self.close()
+            raise SafeOpenError(
+                409,
+                "artifact_changed",
+                "Artifact was shortened after preview validation",
+            )
+        self._remaining -= len(chunk)
+        if self._remaining == 0:
+            self.close()
+        return chunk
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._opened.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except OSError:
+            pass
 
 
 _DIRECTORY_FLAGS = (

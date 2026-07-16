@@ -10,13 +10,17 @@ from alembic import command
 from alembic.config import Config
 from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
-from sqlalchemy import Engine, create_engine, event, inspect, select, text
+from sqlalchemy import Connection, Engine, create_engine, event, inspect, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from . import SCHEMA_VERSION
 from .config import Settings
+from .migrations.fts_v0001 import SEARCH_TRIGGER_NAMES, SEARCH_TRIGGER_SQL
 from .models import SchemaVersion
-from .schema_validation import validate_current_schema
+from .schema_validation import (
+    validate_current_schema,
+    validate_trigger_definitions,
+)
 from .sqlite_backup import (
     SQLiteBackupIntegrityError,
     create_verified_sqlite_backup,
@@ -82,14 +86,14 @@ class Database:
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
         # This is a single-writer application and its default data directory may
-        # live on NFS. Prefer SQLite's fully durable rollback-journal policy over
+        # live on NFS. Prefer SQLite's rollback-journal/FULL policy over
         # WAL/NORMAL, whose shared-memory protocol is not safe on network filesystems.
         cursor.execute("PRAGMA synchronous=FULL")
         cursor.execute("PRAGMA busy_timeout=10000")
         cursor.close()
 
     def _enable_and_verify_durable_journal(self) -> None:
-        """Enforce the persistent NFS-safe journal mode and verify durability.
+        """Enforce the configured rollback-journal durability policy.
 
         ``PRAGMA journal_mode=DELETE`` may change the database header when an
         older installation used WAL. Keeping it out of the connection hook lets
@@ -192,6 +196,66 @@ class Database:
                 "foreign_key_check failed: " + repr(violations[:10]),
             )
 
+    def _validate_triggers_before_write(
+        self,
+        *,
+        require_complete: bool,
+        validate_expected_bodies: bool,
+    ) -> None:
+        """Reject executable schema additions before startup can write."""
+
+        connection: sqlite3.Connection | None = None
+        try:
+            if not self.path.exists() or self.path.stat().st_size == 0:
+                return
+            connection = open_sqlite_read_only(self.path)
+            triggers = {
+                str(row[0]): str(row[1] or "")
+                for row in connection.execute(
+                    "SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"
+                )
+            }
+            validate_trigger_definitions(
+                triggers,
+                require_complete=require_complete,
+                validate_expected_bodies=validate_expected_bodies,
+            )
+        except (OSError, sqlite3.Error, RuntimeError) as exc:
+            raise DatabaseSchemaError(
+                self.path,
+                str(exc) or type(exc).__name__,
+            ) from exc
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def _validate_connection_triggers_before_write(
+        self,
+        connection: Connection,
+        *,
+        require_complete: bool,
+        validate_expected_bodies: bool,
+    ) -> None:
+        """Repeat trigger validation while holding the SQLite write lock."""
+
+        try:
+            triggers = {
+                str(row["name"]): str(row["sql"] or "")
+                for row in connection.execute(
+                    text("SELECT name, sql FROM sqlite_master WHERE type = 'trigger'")
+                ).mappings()
+            }
+            validate_trigger_definitions(
+                triggers,
+                require_complete=require_complete,
+                validate_expected_bodies=validate_expected_bodies,
+            )
+        except RuntimeError as exc:
+            raise DatabaseSchemaError(
+                self.path,
+                str(exc) or type(exc).__name__,
+            ) from exc
+
     def _validate_current_schema(self) -> None:
         try:
             with self.engine.connect() as connection:
@@ -280,6 +344,10 @@ class Database:
                 connection.exec_driver_sql("PRAGMA journal_mode").scalar_one()
             ).casefold()
         database_preexisted = bool(user_tables)
+        self._validate_triggers_before_write(
+            require_complete=current == head,
+            validate_expected_bodies=current == head,
+        )
         durable_journal_enabled = False
         if current != head:
             pending = list(scripts.iterate_revisions(head, current or "base"))
@@ -304,9 +372,29 @@ class Database:
                 # uses the same connection without nesting or committing it.
                 with self.engine.connect() as connection:
                     connection.exec_driver_sql("BEGIN IMMEDIATE")
+                    self._validate_connection_triggers_before_write(
+                        connection,
+                        require_complete=False,
+                        validate_expected_bodies=False,
+                    )
+                    for trigger_name in SEARCH_TRIGGER_NAMES:
+                        connection.exec_driver_sql(
+                            f'DROP TRIGGER IF EXISTS "{trigger_name}"'
+                        )
                     config.attributes["connection"] = connection
                     try:
                         command.upgrade(config, revision.revision)
+                        for trigger_name in SEARCH_TRIGGER_NAMES:
+                            connection.exec_driver_sql(
+                                f'DROP TRIGGER IF EXISTS "{trigger_name}"'
+                            )
+                        for statement in SEARCH_TRIGGER_SQL.values():
+                            connection.exec_driver_sql(statement)
+                        self._validate_connection_triggers_before_write(
+                            connection,
+                            require_complete=True,
+                            validate_expected_bodies=True,
+                        )
                     except BaseException:
                         connection.rollback()
                         raise
@@ -330,12 +418,28 @@ class Database:
             if database_preexisted and initial_journal_mode != "delete":
                 self._verified_pre_journal_change_backup()
             self._enable_and_verify_durable_journal()
-        with self.Session.begin() as session:
-            version = session.scalar(select(SchemaVersion).order_by(SchemaVersion.version.desc()))
-            if version is None:
-                session.add(SchemaVersion(version=int(SCHEMA_VERSION)))
-            elif version.version != int(SCHEMA_VERSION):
-                raise DatabaseCompatibilityError(version.version, int(SCHEMA_VERSION))
+        with self.Session() as session:
+            try:
+                session.execute(text("BEGIN IMMEDIATE"))
+                self._validate_connection_triggers_before_write(
+                    session.connection(),
+                    require_complete=True,
+                    validate_expected_bodies=True,
+                )
+                version = session.scalar(
+                    select(SchemaVersion).order_by(SchemaVersion.version.desc())
+                )
+                if version is None:
+                    session.add(SchemaVersion(version=int(SCHEMA_VERSION)))
+                elif version.version != int(SCHEMA_VERSION):
+                    raise DatabaseCompatibilityError(
+                        version.version,
+                        int(SCHEMA_VERSION),
+                    )
+                session.commit()
+            except BaseException:
+                session.rollback()
+                raise
         # Validate the committed current schema and relational health before the
         # caller can serve requests or open an ordinary application session.
         self._validate_current_schema()

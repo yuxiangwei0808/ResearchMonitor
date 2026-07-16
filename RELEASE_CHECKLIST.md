@@ -4,7 +4,7 @@ This file records the reproducible release-candidate checks run on 2026-07-16. A
 
 | Area | Reproducible command or scenario | Recorded result |
 | --- | --- | --- |
-| Backend | `uv run pytest tests/backend` | 220 passed |
+| Backend | `uv run pytest tests/backend` | 233 passed |
 | Frontend unit/component | `cd frontend && npm test -- --run` | 87 passed |
 | Browser end-to-end | `cd frontend && npm run test:e2e` | 5 passed against the production FastAPI/Vite bundle |
 | Companion skill | `uv run pytest tests/skill` | 9 passed |

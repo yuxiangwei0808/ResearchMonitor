@@ -597,7 +597,10 @@ def test_forged_current_head_schema_errors_are_structured(
     listed_error = json.loads(listed.output)["error"]
     assert listed_error["code"] == "database_schema_invalid"
     assert listed_error["details"]["path"] == str(database_path)
-    assert "missing ORM tables" in listed_error["details"]["detail"]
+    assert any(
+        marker in listed_error["details"]["detail"]
+        for marker in ("missing ORM tables", "search trigger set")
+    )
 
     served = runner.invoke(app, ["serve", "--port", "9464"])
     assert served.exit_code == 5, served.output

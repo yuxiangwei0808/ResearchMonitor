@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 
-from research_monitor.preview import open_regular_beneath
+from research_monitor.preview import SafeOpenError, open_regular_beneath
+from research_monitor.proposals import AppService
 
 from .conftest import enroll, mutate
 from .test_api import op
@@ -165,6 +168,194 @@ def test_opened_artifact_streams_the_same_validated_file_descriptor(
     safe.symlink_to(outside)
 
     assert opened.read_all() == b"validated-content"
+
+
+def test_markdown_descriptor_read_is_capped_at_validated_size(
+    project_root: Path,
+) -> None:
+    safe = project_root / "growing.md"
+    initial = b"# validated snapshot\n"
+    safe.write_bytes(initial)
+    opened = open_regular_beneath(project_root, safe.name)
+    with safe.open("ab") as handle:
+        handle.write(b"x" * (1024 * 1024))
+
+    assert opened.size_bytes == len(initial)
+    assert opened.read_all() == initial
+
+
+def test_stream_descriptor_ignores_continuous_growth_after_open(
+    project_root: Path,
+) -> None:
+    safe = project_root / "growing.log"
+    initial = b"0123456789"
+    safe.write_bytes(initial)
+    opened = open_regular_beneath(project_root, safe.name)
+    chunks = opened.iter_bytes(chunk_size=4)
+    first = next(chunks)
+    with safe.open("ab") as handle:
+        handle.write(b"new-data" * (256 * 1024))
+
+    assert first + b"".join(chunks) == initial
+
+
+def test_descriptor_read_detects_shortening_after_validation(
+    project_root: Path,
+) -> None:
+    safe = project_root / "shortened.txt"
+    safe.write_bytes(b"validated-content")
+    opened = open_regular_beneath(project_root, safe.name)
+    safe.write_bytes(b"x")
+
+    with pytest.raises(SafeOpenError, match="shortened after preview validation"):
+        opened.read_all()
+
+
+def test_stream_descriptor_detects_shortening_after_validation(
+    project_root: Path,
+) -> None:
+    safe = project_root / "shortened.log"
+    safe.write_bytes(b"validated-content")
+    opened = open_regular_beneath(project_root, safe.name)
+    safe.write_bytes(b"x")
+
+    with pytest.raises(SafeOpenError, match="shortened after preview validation"):
+        b"".join(opened.iter_bytes(chunk_size=4))
+
+def test_unstarted_stream_iterator_can_release_descriptor(
+    project_root: Path,
+) -> None:
+    safe = project_root / "unstarted.log"
+    safe.write_bytes(b"validated-content")
+    opened = open_regular_beneath(project_root, safe.name)
+    descriptor = opened.fd
+    iterator = opened.iter_bytes()
+
+    iterator.close()
+    assert opened.fd == -1
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+
+
+def test_invalid_stream_chunk_size_closes_descriptor(
+    project_root: Path,
+) -> None:
+    safe = project_root / "invalid-chunk.log"
+    safe.write_bytes(b"validated-content")
+    opened = open_regular_beneath(project_root, safe.name)
+    descriptor = opened.fd
+
+    with pytest.raises(ValueError, match="chunk_size must be positive"):
+        opened.iter_bytes(chunk_size=0)
+
+    assert opened.fd == -1
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+
+def test_preview_response_is_capped_when_file_grows_after_validation(
+    client: TestClient,
+    project_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    safe = project_root / "growing-response.txt"
+    initial = b"validated-response"
+    safe.write_bytes(initial)
+    project = enroll(client, project_root)
+    root_id = client.get(
+        f"/api/v1/projects/{project['id']}/snapshot"
+    ).json()["artifact_roots"][0]["id"]
+    artifact_id = str(uuid4())
+    mutate(client, project, 0, [op("artifact.create", {
+        "id": artifact_id,
+        "kind": "local",
+        "artifact_root_id": root_id,
+        "locator": safe.name,
+        "label": "Growing response",
+    })])
+    original = AppService.artifact_preview
+
+    def append_after_open(
+        service: AppService,
+        session: object,
+        requested_artifact_id: str,
+    ):
+        opened = original(service, session, requested_artifact_id)
+        with safe.open("ab") as handle:
+            handle.write(b"x" * (1024 * 1024))
+        return opened
+
+    monkeypatch.setattr(AppService, "artifact_preview", append_after_open)
+    response = client.get(f"/api/v1/artifacts/{artifact_id}/preview")
+
+    assert response.status_code == 200
+    assert response.content == initial
+    assert response.headers["content-length"] == str(len(initial))
+
+
+def test_preview_shortening_returns_structured_conflict(
+    client: TestClient,
+    project_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    safe = project_root / "shortened-response.txt"
+    safe.write_bytes(b"validated-response")
+    project = enroll(client, project_root)
+    root_id = client.get(
+        f"/api/v1/projects/{project['id']}/snapshot"
+    ).json()["artifact_roots"][0]["id"]
+    artifact_id = str(uuid4())
+    mutate(client, project, 0, [op("artifact.create", {
+        "id": artifact_id,
+        "kind": "local",
+        "artifact_root_id": root_id,
+        "locator": safe.name,
+        "label": "Shortened response",
+    })])
+    original = AppService.artifact_preview
+
+    def truncate_after_open(
+        service: AppService,
+        session: object,
+        requested_artifact_id: str,
+    ):
+        opened = original(service, session, requested_artifact_id)
+        safe.write_bytes(b"x")
+        return opened
+
+    monkeypatch.setattr(AppService, "artifact_preview", truncate_after_open)
+    response = client.get(f"/api/v1/artifacts/{artifact_id}/preview")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "artifact_changed"
+
+
+def test_unicode_preview_filename_uses_rfc5987_header(
+    client: TestClient,
+    project_root: Path,
+) -> None:
+    safe = project_root / "报告.txt"
+    safe.write_text("validated", encoding="utf-8")
+    project = enroll(client, project_root)
+    root_id = client.get(
+        f"/api/v1/projects/{project['id']}/snapshot"
+    ).json()["artifact_roots"][0]["id"]
+    artifact_id = str(uuid4())
+    mutate(client, project, 0, [op("artifact.create", {
+        "id": artifact_id,
+        "kind": "local",
+        "artifact_root_id": root_id,
+        "locator": safe.name,
+        "label": "Unicode report",
+    })])
+
+    response = client.get(f"/api/v1/artifacts/{artifact_id}/preview")
+
+    assert response.status_code == 200
+    disposition = response.headers["content-disposition"]
+    assert 'filename="__.txt"' in disposition
+    assert "filename*=UTF-8''%E6%8A%A5%E5%91%8A.txt" in disposition
 
 
 def test_markdown_preview_is_bounded_html_without_active_content(

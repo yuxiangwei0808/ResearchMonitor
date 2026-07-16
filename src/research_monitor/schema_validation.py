@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 import re
 
 from sqlalchemy import Connection, inspect, text
@@ -23,6 +24,47 @@ _FTS5_TABLE_DDL = re.compile(
     r'\s+USING\s+fts5\s*\(',
     re.IGNORECASE,
 )
+
+
+def validate_trigger_definitions(
+    actual_triggers: Mapping[str, str],
+    *,
+    require_complete: bool,
+    validate_expected_bodies: bool = True,
+) -> None:
+    """Validate every database trigger against the frozen application set.
+
+    Before migrations, missing owned triggers are repairable derived state, but
+    an unexpected trigger is never safe. Pending migrations neutralize the
+    expected-name set while holding the write lock; at the current head every
+    expected body and the complete frozen set are mandatory.
+    """
+
+    expected_names = set(SEARCH_TRIGGER_NAMES)
+    actual_names = set(actual_triggers)
+    missing = sorted(expected_names - actual_names) if require_complete else []
+    unexpected = sorted(actual_names - expected_names)
+    if missing or unexpected:
+        details: list[str] = []
+        if missing:
+            details.append("missing " + ", ".join(missing))
+        if unexpected:
+            details.append("unexpected " + ", ".join(unexpected))
+        raise RuntimeError(
+            "Current Research Monitor search trigger set is incompatible: "
+            + "; ".join(details)
+        )
+
+    if not validate_expected_bodies:
+        return
+    for name in sorted(actual_names):
+        if canonicalize_sql_whitespace(
+            actual_triggers[name]
+        ) != canonicalize_sql_whitespace(SEARCH_TRIGGER_SQL[name]):
+            raise RuntimeError(
+                "Current Research Monitor search trigger definition does not "
+                f"match revision 0001: {name}"
+            )
 
 
 def validate_current_schema(connection: Connection) -> None:
@@ -91,37 +133,13 @@ def validate_current_schema(connection: Connection) -> None:
             "Current Research Monitor FTS5 table declaration does not match revision 0001"
         )
 
-    owned_triggers = {
+    database_triggers = {
         str(row["name"]): str(row["sql"] or "")
         for row in connection.execute(
-            text(
-                "SELECT name, sql FROM sqlite_master "
-                "WHERE type = 'trigger' AND name LIKE 'rm_search_%'"
-            )
+            text("SELECT name, sql FROM sqlite_master WHERE type = 'trigger'")
         ).mappings()
     }
-    expected_names = set(SEARCH_TRIGGER_NAMES)
-    actual_names = set(owned_triggers)
-    if actual_names != expected_names:
-        missing = sorted(expected_names - actual_names)
-        unexpected = sorted(actual_names - expected_names)
-        details: list[str] = []
-        if missing:
-            details.append("missing " + ", ".join(missing))
-        if unexpected:
-            details.append("unexpected " + ", ".join(unexpected))
-        raise RuntimeError(
-            "Current Research Monitor search trigger set is incompatible: "
-            + "; ".join(details)
-        )
-    for name, expected_sql in SEARCH_TRIGGER_SQL.items():
-        if canonicalize_sql_whitespace(
-            owned_triggers[name]
-        ) != canonicalize_sql_whitespace(expected_sql):
-            raise RuntimeError(
-                "Current Research Monitor search trigger definition does not "
-                f"match revision 0001: {name}"
-            )
+    validate_trigger_definitions(database_triggers, require_complete=True)
 
     # A read-only MATCH query makes SQLite parse and open the FTS index without
     # adding validation rows or changing the monitor's semantic state.

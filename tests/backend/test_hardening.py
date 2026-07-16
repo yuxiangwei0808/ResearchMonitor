@@ -180,7 +180,10 @@ def test_restore_rejects_forged_current_head_before_live_replacement(
         restore_backup(database, forged, confirm=True)
 
     assert error.value.code == "invalid_backup"
-    assert "missing ORM tables" in str(error.value.details["reason"])
+    assert any(
+        marker in str(error.value.details["reason"])
+        for marker in ("missing ORM tables", "search trigger set")
+    )
     snapshot = client.get(f"/api/v1/projects/{project['id']}/snapshot")
     assert snapshot.status_code == 200
     assert snapshot.json()["project"]["id"] == project["id"]

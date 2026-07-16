@@ -375,7 +375,10 @@ def test_initialize_rejects_forged_current_head_and_missing_fts_artifacts(
 
     database = Database(forged)
     try:
-        with pytest.raises(DatabaseSchemaError, match="missing ORM tables"):
+        with pytest.raises(
+            DatabaseSchemaError,
+            match="missing ORM tables|search trigger set",
+        ):
             database.initialize()
     finally:
         database.engine.dispose()

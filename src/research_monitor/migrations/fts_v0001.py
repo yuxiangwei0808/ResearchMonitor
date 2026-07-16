@@ -138,53 +138,79 @@ SEARCH_TRIGGER_SQL = {
 }
 
 SEARCH_TRIGGER_NAMES = tuple(SEARCH_TRIGGER_SQL)
+_SQLITE_WHITESPACE = " \t\n\f\r"
 
 
 def canonicalize_sql_whitespace(value: str) -> str:
-    """Collapse SQL whitespace outside quoted values without changing tokens.
+    """Return a quote-preserving token signature for generated SQLite SQL.
 
     SQLite omits surrounding whitespace and the final statement terminator in
     ``sqlite_master.sql``. It otherwise preserves submitted formatting. This
-    accepts formatting-only differences while preserving case and every
-    character inside quoted strings or identifiers, where whitespace matters.
+    accepts every outside-quote whitespace-only spelling, including optional
+    spaces beside punctuation, while preserving case, token boundaries, and
+    every character inside quoted strings or identifiers.
+
+    Tokens are length-prefixed so two different token sequences cannot compare
+    equal merely because a delimiter also appears inside a quoted value.
     """
 
-    source = value.strip()
+    # SQLite's tokenizer recognizes only these five ASCII whitespace codepoints.
+    source = value.strip(_SQLITE_WHITESPACE)
     if source.endswith(";"):
-        source = source[:-1].rstrip()
+        source = source[:-1].rstrip(_SQLITE_WHITESPACE)
 
-    output: list[str] = []
-    quote: str | None = None
-    pending_space = False
+    tokens: list[str] = []
+    punctuation = frozenset("(),;")
+    operator_characters = frozenset(".=<>!|+-*/%&~:^?")
     index = 0
     while index < len(source):
         character = source[index]
-        if quote is not None:
-            output.append(character)
-            if quote == "[":
-                if character == "]":
-                    quote = None
-            elif character == quote:
-                if index + 1 < len(source) and source[index + 1] == quote:
-                    output.append(source[index + 1])
-                    index += 1
-                else:
-                    quote = None
+        if character in _SQLITE_WHITESPACE:
             index += 1
             continue
-
-        if character.isspace():
-            pending_space = True
-            index += 1
-            continue
-        if pending_space and output:
-            output.append(" ")
-        pending_space = False
-        output.append(character)
-        if character in {"'", '"', "`"}:
+        if character in {"'", '"', "`", "["}:
+            start = index
             quote = character
-        elif character == "[":
-            quote = "["
-        index += 1
+            closing = "]" if quote == "[" else quote
+            index += 1
+            while index < len(source):
+                current = source[index]
+                index += 1
+                if current != closing:
+                    continue
+                if quote != "[" and index < len(source) and source[index] == closing:
+                    index += 1
+                    continue
+                break
+            tokens.append(source[start:index])
+            continue
+        if character in punctuation:
+            tokens.append(character)
+            index += 1
+            continue
+        if character in operator_characters:
+            start = index
+            index += 1
+            while (
+                index < len(source)
+                and source[index] in operator_characters
+            ):
+                index += 1
+            tokens.append(source[start:index])
+            continue
 
-    return "".join(output)
+        start = index
+        index += 1
+        while index < len(source):
+            current = source[index]
+            if (
+                current in _SQLITE_WHITESPACE
+                or current in punctuation
+                or current in operator_characters
+                or current in {"'", '"', "`", "["}
+            ):
+                break
+            index += 1
+        tokens.append(source[start:index])
+
+    return "".join(f"{len(token)}:{token}" for token in tokens)
