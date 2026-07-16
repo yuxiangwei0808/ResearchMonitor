@@ -1,0 +1,243 @@
+from __future__ import annotations
+
+import hashlib
+from collections import defaultdict
+from pathlib import PurePosixPath
+from typing import Iterable
+from uuid import uuid4
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from .contracts import AGENT_OPERATION_SCHEMAS, AGENT_OPERATION_TYPES
+from .models import SourceReference, Task
+from .schemas import Operation
+from .serializers import canonical_json
+from .service import DomainError
+
+
+COMPLETION_EVIDENCE_KINDS = {
+    "completion_text",
+    "user_instruction",
+    "result_evidence",
+}
+
+
+def _completion_capable_evidence(operation: Operation) -> bool:
+    """Require an explicit proof category instead of treating any locator as proof."""
+    for item in operation.evidence:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "").strip()
+        summary = str(item.get("summary") or "").strip()
+        locator = str(item.get("locator") or "").strip()
+        if kind not in COMPLETION_EVIDENCE_KINDS or not summary:
+            continue
+        if kind == "user_instruction" or locator:
+            return True
+    return False
+
+
+def topological_operations(operations: Iterable[Operation]) -> list[Operation]:
+    """Return prerequisites before consumers, preserving source order for ties."""
+    values = list(operations)
+    by_id = {str(operation.id): operation for operation in values}
+    source_order = {str(operation.id): index for index, operation in enumerate(values)}
+    outgoing: dict[str, list[str]] = defaultdict(list)
+    degree = {operation_id: 0 for operation_id in by_id}
+    for operation in values:
+        operation_id = str(operation.id)
+        for prerequisite in operation.prerequisite_operation_ids:
+            prerequisite_id = str(prerequisite)
+            if prerequisite_id not in by_id:
+                raise DomainError(422, "missing_operation_prerequisite", "Operation prerequisite does not exist", {"operation_id": operation_id, "missing": prerequisite_id})
+            outgoing[prerequisite_id].append(operation_id)
+            degree[operation_id] += 1
+    ready = sorted((value for value, count in degree.items() if count == 0), key=source_order.get)
+    result: list[Operation] = []
+    while ready:
+        operation_id = ready.pop(0)
+        result.append(by_id[operation_id])
+        for consumer in sorted(outgoing.get(operation_id, []), key=source_order.get):
+            degree[consumer] -= 1
+            if degree[consumer] == 0:
+                ready.append(consumer)
+                ready.sort(key=source_order.get)
+    if len(result) != len(values):
+        raise DomainError(422, "proposal_dependency_cycle", "Proposal operation prerequisites contain a cycle")
+    return result
+
+
+def proposal_fingerprint(operations: Iterable[Operation]) -> str:
+    """Hash proposal semantics while ignoring transport-scoped operation/group UUIDs."""
+    values = list(operations)
+    created_candidates: list[tuple[str, str]] = []
+    for operation in values:
+        contract = AGENT_OPERATION_SCHEMAS.get(operation.type)
+        if contract is None or contract.get("mode") not in {"create", "link"}:
+            continue
+        raw_id = operation.resolved_entity_id()
+        if not raw_id:
+            continue
+        identity = {
+            "type": operation.type,
+            "data": {
+                key: value for key, value in operation.data.items() if key != "id"
+            },
+            "source_references": operation.source_references,
+            "rationale": operation.rationale,
+        }
+        created_candidates.append((canonical_json(identity), str(raw_id)))
+    created_ids = {
+        raw_id: f"$created:{index}"
+        for index, (_identity, raw_id) in enumerate(sorted(created_candidates))
+    }
+
+    def replace_created(value):
+        if isinstance(value, str):
+            return created_ids.get(value, value)
+        if isinstance(value, dict):
+            return {key: replace_created(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [replace_created(item) for item in value]
+        return value
+
+    base: dict[str, dict] = {}
+    signatures: dict[str, str] = {}
+    groups: dict[str, list[str]] = defaultdict(list)
+    for operation in values:
+        operation_id = str(operation.id)
+        resolved_entity_id = operation.resolved_entity_id()
+        value = {
+            "type": operation.type,
+            "entity_id": replace_created(str(resolved_entity_id)) if resolved_entity_id else None,
+            "expected_version": operation.expected_version,
+            "data": replace_created({key: item for key, item in operation.data.items() if key != "id"}),
+            "rationale": operation.rationale,
+            "confidence": operation.confidence,
+            "evidence": operation.evidence,
+            "source_references": operation.source_references,
+        }
+        base[operation_id] = value
+        signatures[operation_id] = hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+        if operation.atomic_group_id:
+            groups[str(operation.atomic_group_id)].append(operation_id)
+
+    canonical = []
+    for operation in values:
+        operation_id = str(operation.id)
+        group_members = groups.get(str(operation.atomic_group_id), []) if operation.atomic_group_id else []
+        canonical.append({
+            **base[operation_id],
+            "prerequisite_signatures": sorted(signatures[str(value)] for value in operation.prerequisite_operation_ids),
+            "atomic_group_signatures": sorted(signatures[value] for value in group_members),
+        })
+    canonical.sort(key=canonical_json)
+    return hashlib.sha256(canonical_json(canonical).encode("utf-8")).hexdigest()
+
+
+def validate_agent_operations(operations: Iterable[Operation]) -> None:
+    for operation in operations:
+        if operation.type not in AGENT_OPERATION_TYPES:
+            raise DomainError(403, "agent_authority", f"Agents cannot propose {operation.type}")
+        contract = AGENT_OPERATION_SCHEMAS[operation.type]
+        data_contract = contract["data"]
+        allowed = set(data_contract["required"]) | set(data_contract["optional"])
+        unknown = sorted(set(operation.data) - allowed)
+        if unknown:
+            raise DomainError(
+                422, "unknown_operation_field", "Operation data contains unsupported fields",
+                {"operation_id": str(operation.id), "fields": unknown},
+            )
+        missing = [
+            field for field in data_contract["required"]
+            if field not in operation.data or operation.data[field] in {None, ""}
+        ]
+        if missing:
+            raise DomainError(
+                422, "missing_operation_field", "Operation data is missing required fields",
+                {"operation_id": str(operation.id), "fields": missing},
+            )
+        if data_contract["at_least_one_field"] and not operation.data:
+            raise DomainError(422, "empty_operation_update", "Update operation contains no changed fields")
+        if contract["entity_id"] == "client_generated_required" and operation.resolved_entity_id() is None:
+            raise DomainError(422, "missing_client_entity_id", "Create/link operation requires a client entity UUID")
+        if contract["entity_id"] == "target_required" and operation.entity_id is None:
+            raise DomainError(422, "missing_target_entity_id", "Update/archive operation requires the target entity UUID")
+        if contract["expected_version"] == "required" and operation.expected_version is None:
+            raise DomainError(422, "expected_version_required", "Existing entities require expected_version")
+        if contract["expected_version"] == "forbidden" and operation.expected_version is not None:
+            raise DomainError(422, "unexpected_entity_version", "Create operations cannot carry expected_version")
+        if not operation.rationale.strip():
+            raise DomainError(422, "operation_rationale_required", "Every agent operation requires rationale")
+        if operation.confidence is None:
+            raise DomainError(422, "operation_confidence_required", "Every agent operation requires confidence")
+        if not operation.evidence and not operation.source_references:
+            raise DomainError(422, "operation_evidence_required", "Every agent operation requires evidence or a source reference")
+        if operation.type in {"task.create", "task.update"} and operation.data.get("status") == "done":
+            if not str(operation.data.get("completion_summary") or "").strip():
+                raise DomainError(
+                    422,
+                    "completion_summary_required",
+                    "Agent-proposed completion requires a nonempty completion summary",
+                    {"operation_id": str(operation.id)},
+                )
+            if not _completion_capable_evidence(operation):
+                raise DomainError(
+                    422,
+                    "completion_evidence_required",
+                    "Agent-proposed completion requires structured completion_text, user_instruction, or result_evidence proof",
+                    {
+                        "operation_id": str(operation.id),
+                        "accepted_kinds": sorted(COMPLETION_EVIDENCE_KINDS),
+                    },
+                )
+
+
+def persist_source_references(session: Session, project_id: str, operations: Iterable[Operation]) -> None:
+    """Upsert accepted task source anchors without ever merging by task title."""
+    for operation in operations:
+        if not operation.type.startswith("task."):
+            continue
+        task_id = operation.data.get("id") or operation.entity_id
+        if not task_id:
+            continue
+        for raw in operation.source_references:
+            source_path = str(raw.get("path") or raw.get("source_path") or "").strip()
+            if not source_path:
+                continue
+            normalized = PurePosixPath(source_path.replace("\\", "/"))
+            if normalized.is_absolute() or ".." in normalized.parts:
+                raise DomainError(422, "unsafe_source_reference", "Source references must be project-relative", {"path": source_path})
+            source_path = normalized.as_posix()
+            anchor = str(raw.get("anchor") or "")
+            fingerprint = str(raw.get("fingerprint") or raw.get("content_hash") or "")
+            task = session.get(Task, str(task_id))
+            opaque_key = str(raw.get("opaque_key") or (task.user_key if task else "") or "")
+            reference_id = raw.get("id") or raw.get("monitor_reference_id")
+            existing = session.get(SourceReference, str(reference_id)) if reference_id else None
+            if existing is not None and existing.project_id != project_id:
+                raise DomainError(422, "source_reference_project_mismatch", "Source reference belongs to another project")
+            if existing is None:
+                existing = session.scalar(
+                    select(SourceReference).where(
+                        SourceReference.project_id == project_id,
+                        SourceReference.source_path == source_path,
+                        SourceReference.anchor == anchor,
+                        SourceReference.opaque_key == opaque_key,
+                    )
+                )
+            if existing is None:
+                session.add(
+                    SourceReference(
+                        id=str(uuid4()), project_id=project_id, task_id=str(task_id),
+                        source_path=source_path, anchor=anchor, opaque_key=opaque_key,
+                        fingerprint=fingerprint,
+                    )
+                )
+            else:
+                if existing.task_id not in {None, str(task_id)}:
+                    raise DomainError(409, "source_identity_conflict", "Source identity is already attached to another task")
+                existing.task_id = str(task_id)
+                if fingerprint:
+                    existing.fingerprint = fingerprint
