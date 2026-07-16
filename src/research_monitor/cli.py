@@ -78,7 +78,15 @@ def _exit_for(exc: DomainError) -> int:
         "database_schema_invalid",
     }:
         return 5
-    if exc.status_code == 503 or exc.code in {"server_unavailable", "lock_unavailable", "transport_unavailable", "application_running", "unsafe_runtime_descriptor"}: return 6
+    if exc.status_code == 503 or exc.code in {
+        "server_unavailable",
+        "lock_unavailable",
+        "transport_unavailable",
+        "application_running",
+        "unsafe_runtime_descriptor",
+        "backup_integrity_failed",
+    }:
+        return 6
     return 2
 
 

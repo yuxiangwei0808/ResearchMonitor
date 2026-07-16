@@ -8,6 +8,7 @@ import socket
 import subprocess
 import sys
 import sysconfig
+import tarfile
 import time
 import urllib.request
 import zipfile
@@ -23,28 +24,57 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture(scope="module")
-def built_wheel(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    output = tmp_path_factory.mktemp("release-wheel")
+def built_distributions(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    output = tmp_path_factory.mktemp("release-distributions")
     uv = shutil.which("uv")
     assert uv is not None, "uv is required for release verification"
     result = subprocess.run(
-        [uv, "build", "--wheel", "--out-dir", str(output)],
+        [uv, "build", "--out-dir", str(output)],
         cwd=ROOT,
         text=True,
         capture_output=True,
         check=False,
     )
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-    wheels = list(output.glob("research_monitor-*.whl"))
+    return output
+
+
+@pytest.fixture(scope="module")
+def built_wheel(built_distributions: Path) -> Path:
+    wheels = list(built_distributions.glob("research_monitor-*.whl"))
     assert len(wheels) == 1
     return wheels[0]
 
 
-def test_wheel_contains_exact_current_python_frontend_and_skill_trees(
+@pytest.fixture(scope="module")
+def built_sdist(built_distributions: Path) -> Path:
+    sdists = list(built_distributions.glob("research_monitor-*.tar.gz"))
+    assert len(sdists) == 1
+    return sdists[0]
+
+
+def test_distributions_contain_exact_python_frontend_skill_and_license_trees(
     built_wheel: Path,
+    built_sdist: Path,
 ) -> None:
+    expected = (ROOT / "LICENSE").read_bytes()
+
     with zipfile.ZipFile(built_wheel) as archive:
         names = {name for name in archive.namelist() if not name.endswith("/")}
+        wheel_licenses = [
+            name
+            for name in archive.namelist()
+            if ".dist-info/licenses/" in name and name.endswith("/LICENSE")
+        ]
+        assert len(wheel_licenses) == 1
+        assert archive.read(wheel_licenses[0]) == expected
+
+    with tarfile.open(built_sdist, mode="r:gz") as archive:
+        sdist_licenses = [name for name in archive.getnames() if name.endswith("/LICENSE")]
+        assert len(sdist_licenses) == 1
+        extracted = archive.extractfile(sdist_licenses[0])
+        assert extracted is not None
+        assert extracted.read() == expected
 
     skill_prefix = "research_monitor/bundled_skill/"
     skill_files = {name.removeprefix(skill_prefix) for name in names if name.startswith(skill_prefix)}

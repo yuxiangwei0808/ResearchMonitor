@@ -262,7 +262,7 @@ def test_cli_restore_requires_exclusive_lock_and_reopens_restored_state(
     reset_database_singleton()
 
 
-def test_cli_backup_succeeds_before_incompatible_database_can_initialize(
+def test_cli_managed_backup_succeeds_before_incompatible_database_can_initialize(
     tmp_path: Path, monkeypatch
 ) -> None:
     home = tmp_path / "monitor-home"
@@ -287,19 +287,23 @@ def test_cli_backup_succeeds_before_incompatible_database_can_initialize(
     before = hashlib.sha256(source.read_bytes()).hexdigest()
     output = tmp_path / "legacy-backup.db"
 
-    created = runner.invoke(
+    rejected = runner.invoke(
         app, ["backup", "create", "--output", str(output)],
     )
+    assert rejected.exit_code == 6, rejected.output
+    assert json.loads(rejected.output)["error"]["code"] == "cannot_validate_backup_target"
+    assert not output.exists()
 
+    created = runner.invoke(app, ["backup", "create"])
     assert created.exit_code == 0, created.output
-    assert json.loads(created.output)["data"] == {
-        "integrity": "ok",
-        "path": str(output),
-    }
+    payload = json.loads(created.output)["data"]
+    assert payload["integrity"] == "ok"
+    backup = Path(payload["path"])
+    assert backup.parent == home / "backups"
     assert hashlib.sha256(source.read_bytes()).hexdigest() == before
     assert not Path(f"{source}-wal").exists()
     assert not Path(f"{source}-shm").exists()
-    check = sqlite3.connect(f"{output.resolve().as_uri()}?mode=ro", uri=True)
+    check = sqlite3.connect(f"{backup.resolve().as_uri()}?mode=ro", uri=True)
     try:
         assert check.execute("PRAGMA integrity_check").fetchone() == ("ok",)
         assert check.execute("SELECT version FROM schema_versions").fetchone() == (999,)
@@ -309,6 +313,46 @@ def test_cli_backup_succeeds_before_incompatible_database_can_initialize(
     finally:
         check.close()
     reset_database_singleton()
+
+def test_cli_custom_backup_fails_closed_when_database_cannot_enumerate_roots(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = tmp_path / "monitor-home"
+    project = tmp_path / "research"
+    home.mkdir()
+    project.mkdir()
+    monkeypatch.setenv("RESEARCH_MONITOR_HOME", str(home))
+    monkeypatch.setenv("RESEARCH_MONITOR_ALLOWED_ROOTS", str(tmp_path))
+    reset_database_singleton()
+
+    added = runner.invoke(app, ["project", "add", str(project), "--json"])
+    assert added.exit_code == 0, added.output
+    reset_database_singleton()
+    database_path = home / "monitor.db"
+    database_path.write_bytes(b"not a SQLite database")
+    target_parent = project / "must-not-be-created"
+    target = target_parent / "monitor-backup.db"
+
+    rejected = runner.invoke(
+        app,
+        ["backup", "create", "--output", str(target)],
+    )
+
+    assert rejected.exit_code == 6, rejected.output
+    assert json.loads(rejected.output)["error"]["code"] == "cannot_validate_backup_target"
+    assert not target_parent.exists()
+    assert not target.exists()
+    assert not list(project.rglob(f".{target.name}.*.tmp"))
+
+    managed = runner.invoke(app, ["backup", "create"])
+    assert managed.exit_code == 6, managed.output
+    assert json.loads(managed.output)["error"] == {
+        "code": "backup_integrity_failed",
+        "message": "Backup source could not be read as a valid SQLite database",
+    }
+    assert not list((home / "backups").glob(".*.tmp"))
+    reset_database_singleton()
+
 
 def test_cli_serve_force_restart_retains_the_released_writer_lock(
     tmp_path: Path, monkeypatch

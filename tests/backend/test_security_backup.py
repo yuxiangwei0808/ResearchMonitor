@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 import pytest
 
 
+import research_monitor.backup as backup_module
 from research_monitor.backup import create_backup
+from research_monitor.database import Database
 
 from research_monitor.service import DomainError
 from .conftest import enroll, mutate
@@ -50,6 +53,67 @@ def test_backup_rejects_live_sqlite_files_and_enrolled_roots(
     response = client.post("/api/v1/backup", json={"output": str(project_root / "api-backup.db")})
     assert response.status_code == 422
     assert response.json()["detail"]["code"] == "backup_target_in_project"
+
+
+def test_custom_backup_target_fails_closed_when_roots_cannot_be_enumerated(
+    client: TestClient, project_root: Path, database, monkeypatch
+) -> None:
+    enroll(client, project_root)
+    target_parent = project_root / "must-not-be-created"
+    target = target_parent / "monitor-backup.db"
+
+    def fail_root_query(_path: Path) -> sqlite3.Connection:
+        raise sqlite3.DatabaseError("simulated corrupt root catalog")
+
+    monkeypatch.setattr(backup_module, "open_sqlite_read_only", fail_root_query)
+    with pytest.raises(DomainError) as error:
+        create_backup(database, target)
+
+    assert error.value.code == "cannot_validate_backup_target"
+    assert not target_parent.exists()
+    assert not target.exists()
+    assert not list(project_root.rglob(f".{target.name}.*.tmp"))
+
+    managed = create_backup(database)
+    assert managed.parent == database.path.parent / "backups"
+    assert managed.is_file()
+
+
+def test_current_schema_missing_root_catalogs_fails_closed(
+    database, tmp_path: Path
+) -> None:
+    connection = sqlite3.connect(database.path)
+    try:
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute("DROP TABLE artifact_roots")
+        connection.commit()
+    finally:
+        connection.close()
+
+    target = tmp_path / "must-not-exist" / "monitor-backup.db"
+    with pytest.raises(DomainError) as error:
+        create_backup(database, target)
+
+    assert error.value.code == "cannot_validate_backup_target"
+    assert not target.parent.exists()
+
+
+def test_managed_backup_still_rejects_a_healthy_relocated_storage_overlap(
+    client: TestClient, project_root: Path, database, tmp_path: Path
+) -> None:
+    enroll(client, project_root)
+    portable = create_backup(database, tmp_path / "portable.db")
+    relocated_path = project_root / "monitor.db"
+    relocated_path.write_bytes(portable.read_bytes())
+    relocated = Database(relocated_path)
+    try:
+        with pytest.raises(DomainError) as error:
+            create_backup(relocated)
+    finally:
+        relocated.engine.dispose()
+
+    assert error.value.code == "backup_target_in_project"
+    assert not (project_root / "backups").exists()
 
 
 def test_backup_no_force_never_replaces_target_created_during_publication(

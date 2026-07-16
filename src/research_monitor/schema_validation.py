@@ -4,26 +4,19 @@ import re
 
 from sqlalchemy import Connection, inspect, text
 
+from .migrations.fts_v0001 import (
+    SEARCH_COLUMNS,
+    SEARCH_CREATE_SQL,
+    SEARCH_TABLE,
+    SEARCH_TRIGGER_NAMES,
+    SEARCH_TRIGGER_SQL,
+    canonicalize_sql_whitespace,
+)
 from .migrations.schema_v0001 import validate_v0001_adopted_schema
 from .migrations.schema_v0002 import validate_v0002_graph_viewports
 from .models import Base
 
 
-SEARCH_TABLE = "research_search"
-SEARCH_COLUMNS = ("project_id", "entity_type", "entity_id", "title", "content")
-SEARCH_TRIGGER_NAMES = frozenset(
-    {
-        "rm_search_task_ai",
-        "rm_search_task_au",
-        "rm_search_task_ad",
-        "rm_search_journal_ai",
-        "rm_search_journal_au",
-        "rm_search_journal_ad",
-        "rm_search_artifact_ai",
-        "rm_search_artifact_au",
-        "rm_search_artifact_ad",
-    }
-)
 _FTS5_TABLE_DDL = re.compile(
     r'^\s*CREATE\s+VIRTUAL\s+TABLE\s+'
     r'(?:(?:"research_search")|(?:\[research_search\])|(?:`research_search`)|research_search)'
@@ -91,19 +84,27 @@ def validate_current_schema(connection: Connection) -> None:
         raise RuntimeError(
             "Current Research Monitor FTS5 table has an incompatible visible-column shape"
         )
+    if canonicalize_sql_whitespace(search_sql) != canonicalize_sql_whitespace(
+        SEARCH_CREATE_SQL
+    ):
+        raise RuntimeError(
+            "Current Research Monitor FTS5 table declaration does not match revision 0001"
+        )
 
     owned_triggers = {
-        str(row["name"])
+        str(row["name"]): str(row["sql"] or "")
         for row in connection.execute(
             text(
-                "SELECT name FROM sqlite_master "
+                "SELECT name, sql FROM sqlite_master "
                 "WHERE type = 'trigger' AND name LIKE 'rm_search_%'"
             )
         ).mappings()
     }
-    if owned_triggers != SEARCH_TRIGGER_NAMES:
-        missing = sorted(SEARCH_TRIGGER_NAMES - owned_triggers)
-        unexpected = sorted(owned_triggers - SEARCH_TRIGGER_NAMES)
+    expected_names = set(SEARCH_TRIGGER_NAMES)
+    actual_names = set(owned_triggers)
+    if actual_names != expected_names:
+        missing = sorted(expected_names - actual_names)
+        unexpected = sorted(actual_names - expected_names)
         details: list[str] = []
         if missing:
             details.append("missing " + ", ".join(missing))
@@ -113,6 +114,14 @@ def validate_current_schema(connection: Connection) -> None:
             "Current Research Monitor search trigger set is incompatible: "
             + "; ".join(details)
         )
+    for name, expected_sql in SEARCH_TRIGGER_SQL.items():
+        if canonicalize_sql_whitespace(
+            owned_triggers[name]
+        ) != canonicalize_sql_whitespace(expected_sql):
+            raise RuntimeError(
+                "Current Research Monitor search trigger definition does not "
+                f"match revision 0001: {name}"
+            )
 
     # A read-only MATCH query makes SQLite parse and open the FTS index without
     # adding validation rows or changing the monitor's semantic state.

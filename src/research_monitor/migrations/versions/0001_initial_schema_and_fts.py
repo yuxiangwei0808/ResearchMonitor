@@ -18,6 +18,14 @@ from research_monitor.migrations.schema_v0001 import (
     V0001_TABLE_NAMES,
     validate_v0001_adopted_schema,
 )
+from research_monitor.migrations.fts_v0001 import (
+    SEARCH_COLUMNS,
+    SEARCH_CREATE_SQL,
+    SEARCH_TABLE,
+    SEARCH_TRIGGER_NAMES,
+    SEARCH_TRIGGER_SQL,
+    canonicalize_sql_whitespace,
+)
 
 
 revision = "0001"
@@ -26,39 +34,12 @@ branch_labels = None
 depends_on = None
 
 
-SEARCH_TABLE = "research_search"
-SEARCH_COLUMNS = ("project_id", "entity_type", "entity_id", "title", "content")
-SEARCH_TRIGGER_NAMES = (
-    "rm_search_task_ai",
-    "rm_search_task_au",
-    "rm_search_task_ad",
-    "rm_search_journal_ai",
-    "rm_search_journal_au",
-    "rm_search_journal_ad",
-    "rm_search_artifact_ai",
-    "rm_search_artifact_au",
-    "rm_search_artifact_ad",
-)
-SEARCH_CREATE_SQL = f"""
-CREATE VIRTUAL TABLE {SEARCH_TABLE} USING fts5(
-    project_id UNINDEXED,
-    entity_type UNINDEXED,
-    entity_id UNINDEXED,
-    title,
-    content,
-    tokenize = 'unicode61 remove_diacritics 2'
-)
-"""
 _FTS5_TABLE_DDL = re.compile(
     r'^\s*CREATE\s+VIRTUAL\s+TABLE\s+'
     r'(?:"research_search"|\[research_search\]|\x60research_search\x60|research_search)'
     r'\s+USING\s+fts5\s*\(',
     re.IGNORECASE,
 )
-
-
-def _canonical_sql(value: str) -> str:
-    return " ".join(value.strip().rstrip(";").split()).casefold()
 
 
 def _validated_search_table(bind: sa.Connection) -> bool:
@@ -95,22 +76,15 @@ def _validated_search_table(bind: sa.Connection) -> bool:
     return True
 
 
-def _validate_search_objects(
-    bind: sa.Connection,
-    trigger_statements: list[str],
-) -> None:
+def _validate_search_objects(bind: sa.Connection) -> None:
     if not _validated_search_table(bind):
         raise RuntimeError("Research Monitor search index was not created")
     expected_triggers = {
-        name: _canonical_sql(statement)
-        for name, statement in zip(
-            SEARCH_TRIGGER_NAMES,
-            trigger_statements,
-            strict=True,
-        )
+        name: canonicalize_sql_whitespace(statement)
+        for name, statement in SEARCH_TRIGGER_SQL.items()
     }
     actual_triggers = {
-        str(row["name"]): _canonical_sql(str(row["sql"] or ""))
+        str(row["name"]): canonicalize_sql_whitespace(str(row["sql"] or ""))
         for row in bind.execute(
             sa.text("SELECT name, sql FROM sqlite_master WHERE type = 'trigger'")
         ).mappings()
@@ -214,122 +188,7 @@ def rebuild_search_index() -> None:
         op.execute(f"DROP TABLE {SEARCH_TABLE}")
     op.execute(SEARCH_CREATE_SQL)
 
-    statements = [
-        f"""
-        CREATE TRIGGER rm_search_task_ai
-        AFTER INSERT ON tasks WHEN new.deleted_at IS NULL
-        BEGIN
-          INSERT INTO {SEARCH_TABLE}(project_id, entity_type, entity_id, title, content)
-          VALUES (
-            new.project_id, 'task', new.id, new.title,
-            trim(
-              coalesce(new.user_key, '') || ' ' ||
-              coalesce(new.description, '') || ' ' ||
-              coalesce(new.completion_criteria, '') || ' ' ||
-              coalesce(new.blocker_reason, '') || ' ' ||
-              coalesce(new.completion_summary, '') || ' ' ||
-              coalesce(new.labels_json, '')
-            )
-          );
-        END
-        """,
-        f"""
-        CREATE TRIGGER rm_search_task_au
-        AFTER UPDATE ON tasks
-        BEGIN
-          DELETE FROM {SEARCH_TABLE}
-          WHERE entity_type = 'task' AND entity_id = old.id;
-          INSERT INTO {SEARCH_TABLE}(project_id, entity_type, entity_id, title, content)
-          SELECT
-            new.project_id, 'task', new.id, new.title,
-            trim(
-              coalesce(new.user_key, '') || ' ' ||
-              coalesce(new.description, '') || ' ' ||
-              coalesce(new.completion_criteria, '') || ' ' ||
-              coalesce(new.blocker_reason, '') || ' ' ||
-              coalesce(new.completion_summary, '') || ' ' ||
-              coalesce(new.labels_json, '')
-            )
-          WHERE new.deleted_at IS NULL;
-        END
-        """,
-        f"""
-        CREATE TRIGGER rm_search_task_ad
-        AFTER DELETE ON tasks
-        BEGIN
-          DELETE FROM {SEARCH_TABLE}
-          WHERE entity_type = 'task' AND entity_id = old.id;
-        END
-        """,
-        f"""
-        CREATE TRIGGER rm_search_journal_ai
-        AFTER INSERT ON journal_entries WHEN new.deleted_at IS NULL
-        BEGIN
-          INSERT INTO {SEARCH_TABLE}(project_id, entity_type, entity_id, title, content)
-          VALUES (new.project_id, 'journal', new.id, new.entry_type, new.content);
-        END
-        """,
-        f"""
-        CREATE TRIGGER rm_search_journal_au
-        AFTER UPDATE ON journal_entries
-        BEGIN
-          DELETE FROM {SEARCH_TABLE}
-          WHERE entity_type = 'journal' AND entity_id = old.id;
-          INSERT INTO {SEARCH_TABLE}(project_id, entity_type, entity_id, title, content)
-          SELECT new.project_id, 'journal', new.id, new.entry_type, new.content
-          WHERE new.deleted_at IS NULL;
-        END
-        """,
-        f"""
-        CREATE TRIGGER rm_search_journal_ad
-        AFTER DELETE ON journal_entries
-        BEGIN
-          DELETE FROM {SEARCH_TABLE}
-          WHERE entity_type = 'journal' AND entity_id = old.id;
-        END
-        """,
-        f"""
-        CREATE TRIGGER rm_search_artifact_ai
-        AFTER INSERT ON artifacts WHEN new.deleted_at IS NULL
-        BEGIN
-          INSERT INTO {SEARCH_TABLE}(project_id, entity_type, entity_id, title, content)
-          VALUES (
-            new.project_id, 'artifact', new.id, new.label,
-            trim(
-              coalesce(new.provider, '') || ' ' ||
-              coalesce(new.locator, '') || ' ' ||
-              coalesce(new.notes, '')
-            )
-          );
-        END
-        """,
-        f"""
-        CREATE TRIGGER rm_search_artifact_au
-        AFTER UPDATE ON artifacts
-        BEGIN
-          DELETE FROM {SEARCH_TABLE}
-          WHERE entity_type = 'artifact' AND entity_id = old.id;
-          INSERT INTO {SEARCH_TABLE}(project_id, entity_type, entity_id, title, content)
-          SELECT
-            new.project_id, 'artifact', new.id, new.label,
-            trim(
-              coalesce(new.provider, '') || ' ' ||
-              coalesce(new.locator, '') || ' ' ||
-              coalesce(new.notes, '')
-            )
-          WHERE new.deleted_at IS NULL;
-        END
-        """,
-        f"""
-        CREATE TRIGGER rm_search_artifact_ad
-        AFTER DELETE ON artifacts
-        BEGIN
-          DELETE FROM {SEARCH_TABLE}
-          WHERE entity_type = 'artifact' AND entity_id = old.id;
-        END
-        """,
-    ]
-    for statement in statements:
+    for statement in SEARCH_TRIGGER_SQL.values():
         op.execute(statement)
 
     # Rebuilding makes adoption deterministic and repairs interrupted
@@ -374,7 +233,7 @@ def rebuild_search_index() -> None:
         WHERE deleted_at IS NULL
         """
     )
-    _validate_search_objects(bind, statements)
+    _validate_search_objects(bind)
 
 
 def upgrade() -> None:

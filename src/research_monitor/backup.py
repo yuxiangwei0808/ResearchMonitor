@@ -69,24 +69,49 @@ def _path_within(candidate: Path, root: Path) -> bool:
     return candidate == root or root in candidate.parents
 
 
-def _enrolled_roots(database: Database) -> list[Path]:
+def _enrolled_roots(database: Database, *, purpose: str) -> list[Path]:
+    """Read every root needed to prove that a custom output target is safe.
+
+    A damaged database must not turn a failed root query into an empty root
+    set: that would allow a custom backup/export to be published inside an
+    enrolled research directory precisely when the safety check is least
+    reliable.
+    """
+
     roots: list[str] = []
-    connection = open_sqlite_read_only(database.path)
+    connection: sqlite3.Connection | None = None
     try:
+        connection = open_sqlite_read_only(database.path)
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        if "projects" in tables:
-            roots.extend(str(row[0]) for row in connection.execute("SELECT root_path FROM projects"))
-        if "artifact_roots" in tables:
-            roots.extend(str(row[0]) for row in connection.execute("SELECT root_path FROM artifact_roots"))
-    except sqlite3.Error:
-        return []
+        required_catalogs = {"projects", "artifact_roots"}
+        if not required_catalogs.issubset(tables):
+            raise ValueError("the root catalogs are missing")
+        roots.extend(row[0] for row in connection.execute("SELECT root_path FROM projects"))
+        roots.extend(row[0] for row in connection.execute("SELECT root_path FROM artifact_roots"))
+        if any(not isinstance(value, str) or not value for value in roots):
+            raise ValueError("a stored root path is missing or invalid")
+        return [Path(value).expanduser().resolve() for value in roots]
+    except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as exc:
+        raise DomainError(
+            503,
+            f"cannot_validate_{purpose}_target",
+            (
+                f"Cannot validate the {purpose} target because enrolled and "
+                "approved research roots could not be read"
+            ),
+        ) from exc
     finally:
-        connection.close()
-    return [Path(value).expanduser().resolve() for value in roots]
+        if connection is not None:
+            connection.close()
 
 
 def validate_monitor_output_target(
-    database: Database, output: Path, *, purpose: str = "output"
+    database: Database,
+    output: Path,
+    *,
+    purpose: str = "output",
+    check_enrolled_roots: bool = True,
+    allow_unreadable_roots: bool = False,
 ) -> Path:
     target = Path(output).expanduser().resolve()
     database_path = database.path.expanduser().resolve()
@@ -101,7 +126,14 @@ def validate_monitor_output_target(
             422, f"unsafe_{purpose}_target",
             f"{purpose.capitalize()} output cannot replace the live database or its SQLite sidecars",
         )
-    if any(_path_within(target, root) for root in _enrolled_roots(database)):
+    roots: list[Path] = []
+    if check_enrolled_roots:
+        try:
+            roots = _enrolled_roots(database, purpose=purpose)
+        except DomainError:
+            if not allow_unreadable_roots:
+                raise
+    if any(_path_within(target, root) for root in roots):
         raise DomainError(
             422, f"{purpose}_target_in_project",
             f"{purpose.capitalize()} output cannot be written inside an enrolled or approved research root",
@@ -114,7 +146,16 @@ def create_backup(
 ) -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     target = output or database.path.parent / "backups" / f"monitor-{stamp}.db"
-    target = validate_monitor_output_target(database, Path(target), purpose="backup")
+    target = validate_monitor_output_target(
+        database,
+        Path(target),
+        purpose="backup",
+        # A healthy database still proves the managed directory is outside
+        # every enrolled root. Only the monitor-owned recovery destination may
+        # proceed when corruption makes that proof unavailable; every
+        # caller-selected location fails closed.
+        allow_unreadable_roots=output is None,
+    )
     if target.exists() and not force:
         raise DomainError(
             409, "backup_target_exists",
@@ -136,6 +177,12 @@ def create_backup(
             500,
             "backup_integrity_failed",
             "Backup failed SQLite integrity check",
+        ) from exc
+    except sqlite3.Error as exc:
+        raise DomainError(
+            500,
+            "backup_integrity_failed",
+            "Backup source could not be read as a valid SQLite database",
         ) from exc
 
 
