@@ -207,7 +207,7 @@ describe('GraphView', () => {
 
     let parentButton = screen.getByRole('button', { name: 'Select Parent task' })
     expect(parentButton.getAttribute('aria-pressed')).toBe('false')
-    fireEvent.click(parentButton)
+    fireEvent.click(parentButton, { detail: 1 })
     expect(parentButton.getAttribute('aria-pressed')).toBe('true')
     expect(screen.getByRole('button', { name: 'Select Root leaf' })).not.toBeNull()
     expect(screen.queryByRole('button', { name: 'Select Child task' })).toBeNull()

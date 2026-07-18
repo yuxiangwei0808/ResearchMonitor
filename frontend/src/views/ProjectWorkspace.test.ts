@@ -5,4 +5,8 @@ describe('ProjectWorkspace snapshot sections', () => {
   it('loads pipelines for contextual task labels in the Artifacts view', () => {
     expect(snapshotSections.artifacts).toContain('pipelines')
   })
+
+  it('loads automation impact counts for exact Settings stale warnings', () => {
+    expect(snapshotSections.settings).toContain('automation_state')
+  })
 })

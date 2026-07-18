@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from datetime import datetime, timezone
 from uuid import uuid4
 
 import pytest
+from alembic import command
 
 from fastapi.testclient import TestClient
 from research_monitor.api import create_app
 
 import research_monitor.backup as backup_module
+from research_monitor.database import Database
+from research_monitor.migrations.schema_v0001 import V0001_METADATA
+from research_monitor.migrations.schema_v0005 import has_any_v0005_storage
 from research_monitor.backup import create_backup, restore_backup
 from research_monitor.locking import ApplicationLock
 from research_monitor.models import SourceReference
@@ -169,7 +174,7 @@ def test_restore_rejects_forged_current_head_before_live_replacement(
             );
             INSERT INTO schema_versions(version, applied_at) VALUES (1, CURRENT_TIMESTAMP);
             CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL);
-            INSERT INTO alembic_version(version_num) VALUES ('0004');
+            INSERT INTO alembic_version(version_num) VALUES ('0005');
             """
         )
         connection.commit()
@@ -255,3 +260,96 @@ def test_restore_post_swap_integrity_failure_recovers_original_database(
     assert [item["title"] for item in snapshot.json()["pipelines"]] == [
         "Preserve on rollback"
     ]
+
+
+def test_schema_preserving_v01_rollback_restore_remains_at_0004(
+    database, tmp_path: Path
+) -> None:
+    legacy_path = tmp_path / "released-v01.db"
+    legacy = Database(legacy_path)
+    command.upgrade(legacy._alembic_config(), "0004")
+    now = datetime.now(timezone.utc)
+    project_id = str(uuid4())
+    pipeline_id = str(uuid4())
+    with legacy.engine.begin() as connection:
+        connection.execute(
+            V0001_METADATA.tables["projects"].insert(),
+            {
+                "id": project_id,
+                "name": "Rollback project",
+                "root_path": str(tmp_path / "rollback-project-root"),
+                "description": "Preserved from v0.1",
+                "research_goal": "",
+                "success_criteria": "",
+                "color": "#2563eb",
+                "semantic_revision": 1,
+                "layout_revision": 0,
+                "entity_version": 1,
+                "archived_at": None,
+                "trashed_at": None,
+                "last_manual_update_at": now,
+                "last_proposal_at": None,
+                "last_agent_sync_at": None,
+                "created_at": now,
+                "updated_at": now,
+            },
+        )
+        connection.execute(
+            V0001_METADATA.tables["pipelines"].insert(),
+            {
+                "id": pipeline_id,
+                "project_id": project_id,
+                "title": "Preserve this pipeline",
+                "description": "",
+                "flow_mode": "sequential",
+                "order_index": 1.0,
+                "entity_version": 1,
+                "archived_at": None,
+                "deleted_at": None,
+                "created_at": now,
+                "updated_at": now,
+            },
+        )
+    rollback_backup = create_backup(legacy, tmp_path / "pre-0005.db")
+    legacy.engine.dispose()
+
+    current_backup = create_backup(database, tmp_path / "current-0005.db")
+    with pytest.raises(DomainError) as incompatible:
+        restore_backup(
+            database,
+            current_backup,
+            confirm=True,
+            preserve_revision="0004",
+        )
+    assert incompatible.value.code == "invalid_backup"
+    with database.engine.connect() as connection:
+        assert connection.scalar(
+            __import__("sqlalchemy").text(
+                "SELECT version_num FROM alembic_version"
+            )
+        ) == "0005"
+
+    result = restore_backup(
+        database,
+        rollback_backup,
+        confirm=True,
+        preserve_revision="0004",
+    )
+
+    assert result["preserved_revision"] == "0004"
+    assert result["requires_reinstall_before_restart"] is True
+    with database.engine.connect() as connection:
+        assert connection.scalar(
+            __import__("sqlalchemy").text(
+                "SELECT version_num FROM alembic_version"
+            )
+        ) == "0004"
+        assert connection.scalar(
+            __import__("sqlalchemy").text(
+                "SELECT title FROM pipelines WHERE id=:pipeline_id"
+            ),
+            {"pipeline_id": pipeline_id},
+        ) == "Preserve this pipeline"
+        inspector = __import__("sqlalchemy").inspect(connection)
+        assert not has_any_v0005_storage(inspector)
+        assert "planning_profiles" not in set(inspector.get_table_names())

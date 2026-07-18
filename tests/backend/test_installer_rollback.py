@@ -6,7 +6,7 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
-import research_monitor.cli as cli_module
+import research_monitor.skill_installation as installer_module
 from research_monitor.cli import app
 
 
@@ -21,6 +21,7 @@ def test_failed_atomic_skill_update_restores_previous_valid_install(
     source = tmp_path / "bundled-skill"
     shutil.copytree(REPOSITORY / "skills" / "research-monitor", source)
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("RESEARCH_MONITOR_HOME", str(tmp_path / "monitor-home"))
     monkeypatch.setenv("RESEARCH_MONITOR_SKILL_SOURCE", str(source))
     first = runner.invoke(app, ["skill", "install"])
     assert first.exit_code == 0, first.output
@@ -39,7 +40,7 @@ def test_failed_atomic_skill_update_restores_previous_valid_install(
             raise OSError("simulated state commit failure")
         return real_replace(source_path, destination_path)
 
-    monkeypatch.setattr(cli_module.os, "replace", fail_state_commit)
+    monkeypatch.setattr(installer_module.os, "replace", fail_state_commit)
     failed = runner.invoke(app, ["skill", "update"])
     assert failed.exit_code == 2
     assert (destination / "references" / "cli-contract.md").read_text(encoding="utf-8") == old_contract

@@ -3,14 +3,14 @@ from __future__ import annotations
 import hashlib
 from collections import defaultdict
 from pathlib import PurePosixPath
-from typing import Iterable
+from typing import Any, Iterable
 from uuid import uuid4
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .contracts import AGENT_OPERATION_SCHEMAS, AGENT_OPERATION_TYPES
-from .models import SourceReference, Task
+from .models import ArtifactRoot, SourceReference, Task, TaskSourceReference
 from .schemas import Operation
 from .serializers import canonical_json
 from .service import DomainError
@@ -18,22 +18,41 @@ from .service import DomainError
 
 COMPLETION_EVIDENCE_KINDS = {
     "completion_text",
-    "user_instruction",
     "result_evidence",
 }
 
 
-def _completion_capable_evidence(operation: Operation) -> bool:
-    """Require an explicit proof category instead of treating any locator as proof."""
+def _completion_capable_evidence(
+    operation: Operation,
+    *,
+    allow_guided_user_instruction: bool = False,
+) -> bool:
+    """Require an explicit proof category instead of treating any locator as proof.
+
+    A bound ``user_instruction`` is only a potential proof here. Guided
+    validation subsequently verifies the intent identity and its human-owned
+    ``allow_completion`` permission. Unbound/legacy validation never enables
+    this path.
+    """
     for item in operation.evidence:
         if not isinstance(item, dict):
             continue
         kind = str(item.get("kind") or "").strip()
         summary = str(item.get("summary") or "").strip()
-        locator = str(item.get("locator") or "").strip()
-        if kind not in COMPLETION_EVIDENCE_KINDS or not summary:
+        if not summary:
             continue
-        if kind == "user_instruction" or locator:
+        if kind == "user_instruction":
+            if allow_guided_user_instruction:
+                return True
+            continue
+        if kind not in COMPLETION_EVIDENCE_KINDS:
+            continue
+        if kind == "completion_text":
+            return True
+        if any(
+            str(item.get(field) or "").strip()
+            for field in ("artifact_id", "source_reference_id", "content_hash")
+        ):
             return True
     return False
 
@@ -68,9 +87,17 @@ def topological_operations(operations: Iterable[Operation]) -> list[Operation]:
     return result
 
 
-def proposal_fingerprint(operations: Iterable[Operation]) -> str:
+def proposal_fingerprint(
+    operations: Iterable[Operation], *, _contract_version: int = 1
+) -> str:
     """Hash proposal semantics while ignoring transport-scoped operation/group UUIDs."""
     values = list(operations)
+
+    def identity_list(items: list[Any]) -> list[Any]:
+        if _contract_version == 1:
+            return items
+        return sorted(items, key=canonical_json)
+
     created_candidates: list[tuple[str, str]] = []
     for operation in values:
         contract = AGENT_OPERATION_SCHEMAS.get(operation.type)
@@ -84,9 +111,15 @@ def proposal_fingerprint(operations: Iterable[Operation]) -> str:
             "data": {
                 key: value for key, value in operation.data.items() if key != "id"
             },
-            "source_references": operation.source_references,
+            "source_references": identity_list(operation.source_references),
             "rationale": operation.rationale,
         }
+        if _contract_version == 2:
+            identity.update({
+                "basis": operation.basis,
+                "confidence": operation.confidence,
+                "evidence": identity_list(operation.evidence),
+            })
         created_candidates.append((canonical_json(identity), str(raw_id)))
     created_ids = {
         raw_id: f"$created:{index}"
@@ -115,9 +148,11 @@ def proposal_fingerprint(operations: Iterable[Operation]) -> str:
             "data": replace_created({key: item for key, item in operation.data.items() if key != "id"}),
             "rationale": operation.rationale,
             "confidence": operation.confidence,
-            "evidence": operation.evidence,
-            "source_references": operation.source_references,
+            "evidence": identity_list(operation.evidence),
+            "source_references": identity_list(operation.source_references),
         }
+        if _contract_version == 2:
+            value["basis"] = operation.basis
         base[operation_id] = value
         signatures[operation_id] = hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
         if operation.atomic_group_id:
@@ -136,7 +171,43 @@ def proposal_fingerprint(operations: Iterable[Operation]) -> str:
     return hashlib.sha256(canonical_json(canonical).encode("utf-8")).hexdigest()
 
 
-def validate_agent_operations(operations: Iterable[Operation]) -> None:
+def proposal_fingerprint_v2(
+    *,
+    intent_id: str,
+    workflow_mode: str,
+    scope_type: str,
+    scope_id: str | None,
+    result_kind: str,
+    operations: Iterable[Operation],
+    no_change_reason: str | None = None,
+    evidence: list[dict] | None = None,
+    source_references: list[dict] | None = None,
+) -> str:
+    """Hash typed proposal semantics independently from the frozen v1 hash."""
+
+    return hashlib.sha256(
+        canonical_json(
+            {
+                "fingerprint_version": 2,
+                "intent_origin": intent_id,
+                "workflow_mode": workflow_mode,
+                "scope_type": scope_type,
+                "scope_id": scope_id,
+                "result_kind": result_kind,
+                "no_change_reason": no_change_reason,
+                "operation_fingerprint": proposal_fingerprint(operations, _contract_version=2),
+                "evidence": sorted(evidence or [], key=canonical_json),
+                "source_references": sorted(source_references or [], key=canonical_json),
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def validate_agent_operations(
+    operations: Iterable[Operation],
+    *,
+    allow_guided_user_instruction_completion: bool = False,
+) -> None:
     for operation in operations:
         if operation.type not in AGENT_OPERATION_TYPES:
             raise DomainError(403, "agent_authority", f"Agents cannot propose {operation.type}")
@@ -182,11 +253,16 @@ def validate_agent_operations(operations: Iterable[Operation]) -> None:
                     "Agent-proposed completion requires a nonempty completion summary",
                     {"operation_id": str(operation.id)},
                 )
-            if not _completion_capable_evidence(operation):
+            if not _completion_capable_evidence(
+                operation,
+                allow_guided_user_instruction=(
+                    allow_guided_user_instruction_completion
+                ),
+            ):
                 raise DomainError(
                     422,
                     "completion_evidence_required",
-                    "Agent-proposed completion requires structured completion_text, user_instruction, or result_evidence proof",
+                    "Unbound agent completion requires structured completion_text or result_evidence proof",
                     {
                         "operation_id": str(operation.id),
                         "accepted_kinds": sorted(COMPLETION_EVIDENCE_KINDS),
@@ -195,14 +271,33 @@ def validate_agent_operations(operations: Iterable[Operation]) -> None:
 
 
 def persist_source_references(session: Session, project_id: str, operations: Iterable[Operation]) -> None:
-    """Upsert accepted task source anchors without ever merging by task title."""
+    """Upsert accepted identities and attach each supported task use."""
+    project_root = session.scalar(
+        select(ArtifactRoot).where(
+            ArtifactRoot.project_id == project_id,
+            ArtifactRoot.is_project_root.is_(True),
+        )
+    )
     for operation in operations:
-        if not operation.type.startswith("task."):
-            continue
-        task_id = operation.data.get("id") or operation.entity_id
+        if operation.type.startswith("task."):
+            task_id = operation.data.get("id") or operation.entity_id
+        elif operation.type in {"journal.create", "task_artifact.link"}:
+            task_id = operation.data.get("task_id")
+        else:
+            task_id = None
         if not task_id:
             continue
-        for raw in operation.source_references:
+        task = session.get(Task, str(task_id))
+        if task is None or task.project_id != project_id:
+            continue
+        inline_sources = [
+            item
+            for item in operation.evidence
+            if isinstance(item, dict)
+            and item.get("source_root_id")
+            and (item.get("path") or item.get("source_path"))
+        ]
+        for raw in [*operation.source_references, *inline_sources]:
             source_path = str(raw.get("path") or raw.get("source_path") or "").strip()
             if not source_path:
                 continue
@@ -210,9 +305,11 @@ def persist_source_references(session: Session, project_id: str, operations: Ite
             if normalized.is_absolute() or ".." in normalized.parts:
                 raise DomainError(422, "unsafe_source_reference", "Source references must be project-relative", {"path": source_path})
             source_path = normalized.as_posix()
+            source_root_id = str(raw.get("source_root_id") or "") or (
+                project_root.id if project_root is not None else None
+            )
             anchor = str(raw.get("anchor") or "")
             fingerprint = str(raw.get("fingerprint") or raw.get("content_hash") or "")
-            task = session.get(Task, str(task_id))
             opaque_key = str(raw.get("opaque_key") or (task.user_key if task else "") or "")
             reference_id = raw.get("id") or raw.get("monitor_reference_id")
             existing = session.get(SourceReference, str(reference_id)) if reference_id else None
@@ -222,22 +319,45 @@ def persist_source_references(session: Session, project_id: str, operations: Ite
                 existing = session.scalar(
                     select(SourceReference).where(
                         SourceReference.project_id == project_id,
+                        SourceReference.source_root_id == source_root_id,
                         SourceReference.source_path == source_path,
                         SourceReference.anchor == anchor,
                         SourceReference.opaque_key == opaque_key,
                     )
                 )
             if existing is None:
-                session.add(
-                    SourceReference(
-                        id=str(uuid4()), project_id=project_id, task_id=str(task_id),
-                        source_path=source_path, anchor=anchor, opaque_key=opaque_key,
-                        fingerprint=fingerprint,
-                    )
+                existing = SourceReference(
+                    id=str(uuid4()),
+                    project_id=project_id,
+                    task_id=str(task_id),
+                    source_root_id=source_root_id,
+                    source_path=source_path,
+                    anchor=anchor,
+                    opaque_key=opaque_key,
+                    fingerprint=fingerprint,
                 )
+                session.add(existing)
+                session.flush()
             else:
-                if existing.task_id not in {None, str(task_id)}:
-                    raise DomainError(409, "source_identity_conflict", "Source identity is already attached to another task")
-                existing.task_id = str(task_id)
+                if existing.source_root_id not in {None, source_root_id}:
+                    raise DomainError(409, "source_identity_conflict", "Source identity root does not match")
+                existing.source_root_id = source_root_id
+                if existing.task_id is None:
+                    existing.task_id = str(task_id)
                 if fingerprint:
                     existing.fingerprint = fingerprint
+            association = session.scalar(
+                select(TaskSourceReference).where(
+                    TaskSourceReference.task_id == str(task_id),
+                    TaskSourceReference.source_reference_id == existing.id,
+                )
+            )
+            if association is None:
+                session.add(
+                    TaskSourceReference(
+                        id=str(uuid4()),
+                        project_id=project_id,
+                        task_id=str(task_id),
+                        source_reference_id=existing.id,
+                    )
+                )

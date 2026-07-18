@@ -53,6 +53,9 @@ export function useOutboxReplay() {
           await queryClient.invalidateQueries()
         } else if (replay.events.length) {
           const projectIds = new Set(replay.events.map((event) => event.project_id).filter(Boolean))
+          replay.events
+            .filter((event) => event.event_type.toLowerCase().includes('proposal'))
+            .forEach((event) => window.dispatchEvent(new CustomEvent('research-monitor:proposal-update', { detail: event })))
           await Promise.all([
             queryClient.invalidateQueries({ queryKey: ['projects'] }),
             ...[...projectIds].flatMap((projectId) => [

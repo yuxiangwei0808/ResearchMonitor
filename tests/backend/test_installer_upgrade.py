@@ -17,6 +17,7 @@ def test_unmodified_previous_skill_can_update_without_force(tmp_path: Path, monk
     source = tmp_path / "bundled-skill"
     shutil.copytree(REPOSITORY / "skills" / "research-monitor", source)
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("RESEARCH_MONITOR_HOME", str(tmp_path / "monitor-home"))
     monkeypatch.setenv("RESEARCH_MONITOR_SKILL_SOURCE", str(source))
 
     first = runner.invoke(app, ["skill", "install"])

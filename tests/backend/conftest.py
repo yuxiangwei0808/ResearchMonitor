@@ -10,10 +10,18 @@ from research_monitor.config import Settings
 from research_monitor.database import Database
 
 
+@pytest.fixture(autouse=True)
+def enable_test_only_skill_source_override(monkeypatch):
+    """Allow synthetic bundle injection only inside backend tests."""
+
+    monkeypatch.setenv("RESEARCH_MONITOR_ENABLE_TEST_SKILL_SOURCE", "1")
+
+
 @pytest.fixture
 def project_root(tmp_path: Path) -> Path:
     root = tmp_path / "project"
     root.mkdir()
+    (root / "PLAN.md").write_text("# Test research plan\n", encoding="utf-8")
     return root
 
 

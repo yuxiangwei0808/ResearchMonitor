@@ -4,22 +4,25 @@ import hashlib
 import sqlite3
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine
-from sqlalchemy.orm import Session
 
 import research_monitor.database as database_module
 from research_monitor.database import Database, DatabaseIntegrityError, DatabaseSchemaError
-from research_monitor.models import Base, SchemaVersion
+from research_monitor.migrations.schema_v0001 import V0001_METADATA
 
 
 def _create_delete_mode_legacy_database(path: Path) -> None:
     engine = create_engine(f"sqlite:///{path}", future=True)
-    Base.metadata.create_all(engine)
-    with Session(engine) as session, session.begin():
-        session.add(SchemaVersion(version=1))
+    V0001_METADATA.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            V0001_METADATA.tables["schema_versions"].insert(),
+            {"version": 1, "applied_at": datetime.now(timezone.utc)},
+        )
     engine.dispose()
     assert _journal_mode(path) == "delete"
     assert not _sidecars(path)
@@ -83,8 +86,8 @@ def test_initialize_preserves_first_backup_before_enforcing_durable_journal(
     finally:
         database.engine.dispose()
 
-    assert revisions == ["0001", "0002", "0003", "0004"]
-    assert len(list((tmp_path / "backups").glob("pre-migration-*.db"))) == 4
+    assert revisions == ["0001", "0002", "0003", "0004", "0005"]
+    assert len(list((tmp_path / "backups").glob("pre-migration-*.db"))) == 5
     assert _journal_mode(path) == "delete"
 
 
@@ -121,7 +124,7 @@ def test_initialize_converts_wal_only_after_verified_legacy_backup(
     finally:
         database.engine.dispose()
 
-    assert observed_modes == ["wal", "delete", "delete", "delete"]
+    assert observed_modes == ["wal", "delete", "delete", "delete", "delete"]
     assert _journal_mode(path) == "delete"
     assert not _sidecars(path)
 
@@ -366,7 +369,7 @@ def test_initialize_rejects_forged_current_head_and_missing_fts_artifacts(
             );
             INSERT INTO schema_versions(version, applied_at) VALUES (1, CURRENT_TIMESTAMP);
             CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL);
-            INSERT INTO alembic_version(version_num) VALUES ('0004');
+            INSERT INTO alembic_version(version_num) VALUES ('0005');
             """
         )
         connection.commit()

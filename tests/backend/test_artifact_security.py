@@ -64,7 +64,7 @@ def test_common_key_paths_are_never_previewed(client: TestClient, project_root: 
     assert b"DO_NOT_RENDER" not in response.content
 
 
-def test_deleted_artifact_locator_can_be_revived_and_relinked(
+def test_deleted_artifact_locator_cannot_be_recreated(
     client: TestClient, project_root: Path
 ) -> None:
     (project_root / "result.txt").write_text("result", encoding="utf-8")
@@ -77,24 +77,42 @@ def test_deleted_artifact_locator_can_be_revived_and_relinked(
         op("artifact.create", {"id": artifact_id, "kind": "local", "artifact_root_id": root_id, "locator": "result.txt", "label": "Old"}),
     ])
     deleted = mutate(client, project, created["semantic_revision"], [op("artifact.delete", {}, artifact_id, 1)])
-    revived = mutate(client, project, deleted["semantic_revision"], [op(
-        "artifact.create",
-        {"id": str(uuid4()), "kind": "local", "artifact_root_id": root_id, "locator": "result.txt", "label": "Revived"},
-    )])
-    assert revived["results"][0]["entity_id"] == artifact_id
-    linked = mutate(client, project, revived["semantic_revision"], [op(
-        "task_artifact.link", {"task_id": task_id, "artifact_id": artifact_id, "role": "result"},
-    )])
+    collision = client.post(
+        f"/api/v1/projects/{project['id']}/mutations",
+        json={
+            "api_version": "1",
+            "schema_version": "1",
+            "request_id": str(uuid4()),
+            "project_id": project["id"],
+            "base_semantic_revision": deleted["semantic_revision"],
+            "actor_type": "ui",
+            "operations": [
+                op(
+                    "artifact.create",
+                    {
+                        "id": str(uuid4()),
+                        "kind": "local",
+                        "artifact_root_id": root_id,
+                        "locator": "result.txt",
+                        "label": "Replacement",
+                    },
+                )
+            ],
+        },
+    )
 
+    assert collision.status_code == 409, collision.text
+    assert collision.json()["detail"]["code"] == "entity_deleted"
     snapshot = client.get(f"/api/v1/projects/{project['id']}/snapshot").json()
-    artifact = next(item for item in snapshot["artifacts"] if item["id"] == artifact_id)
-    assert linked["semantic_revision"] == 4
-    assert artifact["deleted_at"] is None
-    assert artifact["label"] == "Revived"
-    assert snapshot["task_artifacts"][0]["artifact_id"] == artifact_id
+    assert snapshot["project"]["semantic_revision"] == deleted["semantic_revision"]
+    assert len(snapshot["artifacts"]) == 1
+    assert snapshot["artifacts"][0]["id"] == artifact_id
+    assert snapshot["artifacts"][0]["label"] == "Old"
+    assert snapshot["artifacts"][0]["deleted_at"] is not None
+    assert snapshot["task_artifacts"] == []
 
 
-def test_revived_artifact_can_be_associated_by_new_uuid_in_same_mutation(
+def test_deleted_artifact_locator_cannot_be_recreated_and_linked_in_one_mutation(
     client: TestClient, project_root: Path
 ) -> None:
     (project_root / "same-batch.txt").write_text("result", encoding="utf-8")
@@ -112,21 +130,36 @@ def test_revived_artifact_can_be_associated_by_new_uuid_in_same_mutation(
     deleted = mutate(client, project, created["semantic_revision"], [
         op("artifact.delete", {}, old_artifact_id, 1),
     ])
-    revived = mutate(client, project, deleted["semantic_revision"], [
-        op("artifact.create", {
-            "id": proposed_artifact_id, "kind": "local", "artifact_root_id": root_id,
-            "locator": "same-batch.txt", "label": "Revived",
-        }),
-        op("task_artifact.link", {
-            "task_id": task_id, "artifact_id": proposed_artifact_id, "role": "evidence",
-        }),
-    ])
+    collision = client.post(
+        f"/api/v1/projects/{project['id']}/mutations",
+        json={
+            "api_version": "1",
+            "schema_version": "1",
+            "request_id": str(uuid4()),
+            "project_id": project["id"],
+            "base_semantic_revision": deleted["semantic_revision"],
+            "actor_type": "ui",
+            "operations": [
+                op("artifact.create", {
+                    "id": proposed_artifact_id, "kind": "local", "artifact_root_id": root_id,
+                    "locator": "same-batch.txt", "label": "Replacement",
+                }),
+                op("task_artifact.link", {
+                    "task_id": task_id, "artifact_id": proposed_artifact_id, "role": "evidence",
+                }),
+            ],
+        },
+    )
 
-    assert revived["results"][0]["entity_id"] == old_artifact_id
-    assert revived["results"][1]["value"]["artifact_id"] == old_artifact_id
+    assert collision.status_code == 409, collision.text
+    assert collision.json()["detail"]["code"] == "entity_deleted"
     snapshot = client.get(f"/api/v1/projects/{project['id']}/snapshot").json()
-    assert [item["id"] for item in snapshot["artifacts"]] == [old_artifact_id]
-    assert snapshot["task_artifacts"][0]["artifact_id"] == old_artifact_id
+    assert snapshot["project"]["semantic_revision"] == deleted["semantic_revision"]
+    assert len(snapshot["artifacts"]) == 1
+    assert snapshot["artifacts"][0]["id"] == old_artifact_id
+    assert snapshot["artifacts"][0]["label"] == "Old"
+    assert snapshot["artifacts"][0]["deleted_at"] is not None
+    assert snapshot["task_artifacts"] == []
 
 
 def test_preview_rejects_in_root_symlink_alias(

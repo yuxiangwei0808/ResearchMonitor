@@ -33,6 +33,7 @@ class Project(Base):
     last_manual_update_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
     last_proposal_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
     last_agent_sync_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
+    last_agent_check_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
 
@@ -47,12 +48,36 @@ class ScanPolicy(Base):
     include_globs_json: Mapped[str] = mapped_column(Text, default='["**/*.md","**/*.txt","**/*.py"]')
     exclude_globs_json: Mapped[str] = mapped_column(Text, default="[]")
     sensitive_patterns_json: Mapped[str] = mapped_column(Text, default="[]")
+    readable_source_root_ids_json: Mapped[str] = mapped_column(Text, default="[]")
     max_text_bytes: Mapped[int] = mapped_column(Integer, default=2 * 1024 * 1024)
+    max_files_per_scan: Mapped[int] = mapped_column(Integer, default=500)
+    max_total_text_bytes: Mapped[int] = mapped_column(Integer, default=10 * 1024 * 1024)
     allow_git_metadata: Mapped[bool] = mapped_column(Boolean, default=True)
     git_history_limit: Mapped[int] = mapped_column(Integer, default=100)
     allow_outside_sources: Mapped[bool] = mapped_column(Boolean, default=False)
     follow_symlinks: Mapped[bool] = mapped_column(Boolean, default=False)
     entity_version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class PlanningProfile(Base):
+    __tablename__ = "planning_profiles"
+
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True
+    )
+    task_granularity: Mapped[str] = mapped_column(String(20), default="balanced")
+    max_nesting_depth: Mapped[int] = mapped_column(Integer, default=3)
+    planning_horizon: Mapped[str] = mapped_column(String(30), default="current_milestone")
+    inference_policy: Mapped[str] = mapped_column(String(30), default="cautious_gaps")
+    max_new_tasks_per_proposal: Mapped[int] = mapped_column(Integer, default=30)
+    preferred_pipeline_names_json: Mapped[str] = mapped_column(Text, default="[]")
+    terminology_notes: Mapped[str] = mapped_column(Text, default="")
+    additional_instructions: Mapped[str] = mapped_column(Text, default="")
+    protected_pipeline_ids_json: Mapped[str] = mapped_column(Text, default="[]")
+    protected_task_ids_json: Mapped[str] = mapped_column(Text, default="[]")
+    entity_version: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
 
 
 class ArtifactRoot(Base):
@@ -143,12 +168,28 @@ class TaskEdge(Base):
 
 class JournalEntry(Base):
     __tablename__ = "journal_entries"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "task_id",
+            "origin_key",
+            name="uq_journal_project_task_origin",
+        ),
+        Index(
+            "ix_journal_project_task_occurred",
+            "project_id",
+            "task_id",
+            "occurred_at",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
     task_id: Mapped[str] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"))
     entry_type: Mapped[str] = mapped_column(String(30))
     content: Mapped[str] = mapped_column(Text)
+    origin_key: Mapped[Optional[str]] = mapped_column(String(240), nullable=True)
+    content_sha256: Mapped[str] = mapped_column(String(64), default="")
     occurred_at: Mapped[datetime] = mapped_column(default=utcnow)
     entity_version: Mapped[int] = mapped_column(Integer, default=1)
     deleted_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
@@ -217,12 +258,22 @@ class GraphViewport(Base):
 class SourceReference(Base):
     __tablename__ = "source_references"
     __table_args__ = (
-        UniqueConstraint("project_id", "source_path", "anchor", "opaque_key", name="uq_source_identity"),
+        UniqueConstraint(
+            "project_id",
+            "source_root_id",
+            "source_path",
+            "anchor",
+            "opaque_key",
+            name="uq_source_identity_v2",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
     task_id: Mapped[Optional[str]] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), nullable=True)
+    # Kept nullable for legacy v1 callers. Guided v2 proposals always provide
+    # a validated approved-root identity before persistence.
+    source_root_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     source_path: Mapped[str] = mapped_column(Text)
     anchor: Mapped[str] = mapped_column(Text, default="")
     opaque_key: Mapped[str] = mapped_column(String(240), default="")
@@ -230,8 +281,80 @@ class SourceReference(Base):
     imported_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
+class TaskSourceReference(Base):
+    __tablename__ = "task_source_references"
+    __table_args__ = (
+        UniqueConstraint(
+            "task_id",
+            "source_reference_id",
+            name="uq_task_source_reference",
+        ),
+        Index(
+            "ix_task_source_reference_project_task",
+            "project_id",
+            "task_id",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
+    task_id: Mapped[str] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"))
+    source_reference_id: Mapped[str] = mapped_column(
+        ForeignKey("source_references.id", ondelete="CASCADE")
+    )
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class AgentIntent(Base):
+    __tablename__ = "agent_intents"
+    __table_args__ = (
+        UniqueConstraint("proposal_request_id", name="uq_agent_intent_proposal_request"),
+        Index("ix_agent_intent_project_created", "project_id", "created_at"),
+        Index("ix_agent_intent_project_expires", "project_id", "expires_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    proposal_request_id: Mapped[str] = mapped_column(String(36))
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
+    issued_semantic_revision: Mapped[int] = mapped_column(Integer)
+    planning_profile_version: Mapped[int] = mapped_column(Integer)
+    workflow_mode: Mapped[str] = mapped_column(String(40))
+    scope_type: Mapped[str] = mapped_column(String(20), default="project")
+    scope_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    instructions: Mapped[str] = mapped_column(Text, default="")
+    allow_completion: Mapped[bool] = mapped_column(Boolean, default=False)
+    artifact_locators_json: Mapped[str] = mapped_column(Text, default="[]")
+    regenerates_proposal_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    superseded_by_intent_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column()
+    consumed_proposal_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
 class Proposal(Base):
     __tablename__ = "proposals"
+    __table_args__ = (
+        Index("ix_proposals_intent_id", "intent_id"),
+        Index(
+            "ix_proposals_project_status_created",
+            "project_id",
+            "status",
+            "created_at",
+        ),
+        Index(
+            "ix_proposals_project_mode_scope",
+            "project_id",
+            "workflow_mode",
+            "scope_type",
+            "scope_id",
+        ),
+        Index(
+            "ix_proposals_project_result_created",
+            "project_id",
+            "result_kind",
+            "created_at",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
@@ -243,6 +366,19 @@ class Proposal(Base):
     fingerprint: Mapped[str] = mapped_column(String(128), index=True)
     actor_label: Mapped[str] = mapped_column(String(240), default="Codex")
     rejection_reason: Mapped[str] = mapped_column(Text, default="")
+    proposal_contract_version: Mapped[str] = mapped_column(String(10), default="1")
+    intent_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    workflow_mode: Mapped[str] = mapped_column(String(40), default="legacy_custom")
+    scope_type: Mapped[str] = mapped_column(String(20), default="project")
+    scope_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    result_kind: Mapped[str] = mapped_column(String(20), default="changes")
+    no_change_reason: Mapped[str] = mapped_column(String(40), default="")
+    scan_summary_json: Mapped[str] = mapped_column(Text, default="{}")
+    top_level_evidence_json: Mapped[str] = mapped_column(Text, default="[]")
+    top_level_source_references_json: Mapped[str] = mapped_column(Text, default="[]")
+    fingerprint_version: Mapped[int] = mapped_column(Integer, default=1)
+    regenerates_proposal_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    superseded_by_proposal_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     closed_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
 
@@ -260,6 +396,7 @@ class ProposalOperation(Base):
     confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     evidence_json: Mapped[str] = mapped_column(Text, default="[]")
     source_references_json: Mapped[str] = mapped_column(Text, default="[]")
+    basis: Mapped[str] = mapped_column(String(30), default="")
     disposition: Mapped[str] = mapped_column(String(20), default="pending")
 
 

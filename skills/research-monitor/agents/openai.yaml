@@ -1,4 +1,4 @@
 interface:
   display_name: "Research Monitor"
-  short_description: "Draft evidence-backed research task updates"
-  default_prompt: "Use $research-monitor to inspect this enrolled project and propose evidence-backed task progress updates for review."
+  short_description: "Guide safe, review-only research updates"
+  default_prompt: "Use $research-monitor to follow this Research Monitor dashboard prompt and submit one evidence-backed result for graphical review."

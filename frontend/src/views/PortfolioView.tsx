@@ -1,8 +1,11 @@
-import { ArrowRight, Ban, CheckCircle2, Clock3, FolderPlus, Layers3, Sparkles } from 'lucide-react'
+import { useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
+import { ArrowRight, Ban, Bot, Check, CheckCircle2, Clipboard, Clock3, FolderPlus, Layers3, Sparkles } from 'lucide-react'
 import { Link, useSearchParams } from 'react-router-dom'
 import type { Project } from '../types'
 import { Badge, Button, EmptyState, ProgressBar } from '../components/ui'
-import { relativeDate, shortPath } from '../lib/format'
+import { humanize, relativeDate, shortPath } from '../lib/format'
+import { api } from '../lib/api'
 
 export function PortfolioView({ projects, onAdd }: { projects: Project[]; onAdd: () => void }) {
   const [params] = useSearchParams()
@@ -21,6 +24,8 @@ export function PortfolioView({ projects, onAdd }: { projects: Project[]; onAdd:
         <div><p className="eyebrow">Research workspace</p><h1>{heading}</h1><p>{showTrash ? 'Restore a monitor here, or purge it later from the CLI after a verified backup.' : 'Plan the work, preserve the evidence, and always know the next meaningful step.'}</p></div>
         <Button onClick={onAdd}><FolderPlus size={17} />Add project</Button>
       </header>
+
+      {!showArchived && !showTrash && <OptionalAutomationCard />}
 
       {!visible.length ? (
         <EmptyState
@@ -64,4 +69,44 @@ export function PortfolioView({ projects, onAdd }: { projects: Project[]; onAdd:
       )}
     </div>
   )
+}
+
+export function OptionalAutomationCard() {
+  const [copyStatus, setCopyStatus] = useState('')
+  const skill = useQuery({ queryKey: ['skill-status'], queryFn: api.getSkillStatus, retry: false })
+  const status = skill.data?.status ?? (skill.error ? 'blocked' : 'missing')
+  const setupCommand = skill.data?.setup_command ?? skill.data?.command ?? (
+    status === 'current'
+      ? 'research-monitor skill status'
+      : status === 'blocked'
+        ? 'CODEX_HOME=/safe/codex-home research-monitor skill install'
+        : status === 'missing'
+          ? 'research-monitor skill install'
+          : 'research-monitor skill update'
+  )
+  const statusLabel = status === 'current' ? 'Current' : status === 'missing' ? 'Missing' : status === 'modified' ? 'Modified' : status === 'outdated' ? 'Outdated' : 'Blocked'
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(setupCommand)
+      setCopyStatus('Setup command copied.')
+    } catch {
+      setCopyStatus(`Copy was denied. Run: ${setupCommand}`)
+    }
+  }
+  return <section className="optional-automation-card" aria-labelledby="optional-automation-heading">
+    <span className="optional-automation-icon"><Bot size={20} /></span>
+    <div className="optional-automation-copy">
+      <div className="proposal-title-line"><h2 id="optional-automation-heading">Optional Codex automation</h2><Badge tone={status === 'current' ? 'green' : status === 'blocked' ? 'red' : 'amber'}>{skill.isPending ? 'Checking…' : statusLabel}</Badge></div>
+      <p>Research Monitor works fully without this companion skill. Install or update it only if you want Codex to prepare review-only proposals.</p>
+      {skill.data?.blocking_reason && <small>{skill.data.blocking_reason}</small>}
+      {skill.error && <small>Skill status could not be checked. Manual planning, graphs, journals, artifacts, and recovery remain available.</small>}
+      {skill.data?.destination && <small>Optional destination: <code>{skill.data.destination}</code></small>}
+    </div>
+    <div className="optional-automation-action">
+      <code>{setupCommand}</code>
+      {status !== 'current' && <small>Stop Research Monitor before running this command, then restart it.</small>}
+      <Button type="button" size="sm" variant="secondary" onClick={copy}>{copyStatus.startsWith('Setup command copied') ? <Check size={14} /> : <Clipboard size={14} />}Copy command</Button>
+      <span aria-live="polite">{copyStatus}</span>
+    </div>
+  </section>
 }

@@ -17,22 +17,25 @@ from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import select
 from sqlalchemy.exc import DatabaseError, IntegrityError
 from sqlalchemy.orm import Session
 
 from . import API_VERSION, SCHEMA_VERSION, __version__
 from .backup import create_backup, validate_monitor_output_target
 from .config import Settings, process_start_ticks
+from .contracts import CAPABILITIES
 from .database import Database, get_database
-from .models import Artifact
+from .models import Artifact, ArtifactRoot, Project
 from .mutations import operation_integrity_error
 from .proposals import AppService
 from .preview import SafeOpenError, render_markdown_document
 from .schemas import (
-    LayoutMutationEnvelope, MutationEnvelope, MutationUndo, ProjectCreate, ProposalApply,
+    AgentPromptCreate, LayoutMutationEnvelope, MutationEnvelope, MutationUndo, ProjectCreate, ProposalApply,
     ProposalEnvelope, ProposalReject, ProposalRevision,
 )
 from .service import DomainError
+from .skill_installation import skill_status_value
 
 
 SECURITY_HEADERS = {
@@ -92,7 +95,8 @@ def _is_direct_browser_navigation(request: Request) -> bool:
     """Recognize a user-launched top-level document navigation."""
 
     return (
-        request.headers.get("sec-fetch-site", "").casefold() == "none"
+        request.headers.get("sec-fetch-site", "").casefold()
+        in {"none", "same-origin"}
         and request.headers.get("sec-fetch-mode", "").casefold() == "navigate"
         and request.headers.get("sec-fetch-dest", "").casefold() == "document"
         and request.headers.get("sec-fetch-user", "").casefold() == "?1"
@@ -371,7 +375,22 @@ def create_app(
             "server_instance_id": server_instance_id,
             "server_pid": server_pid,
             "process_start_ticks": server_process_start_ticks,
+            "capabilities": CAPABILITIES,
         }
+
+    @app.get("/api/v1/skill-status")
+    def skill_status(session: Session = SessionDep) -> dict[str, Any]:
+        protected_roots = tuple(
+            [
+                (f"project {project.id}", Path(project.root_path))
+                for project in session.scalars(select(Project)).all()
+            ]
+            + [
+                (f"artifact root {root.id}", Path(root.root_path))
+                for root in session.scalars(select(ArtifactRoot)).all()
+            ]
+        )
+        return skill_status_value(protected_roots)
 
     @app.post("/api/v1/server/stop")
     def stop_server(
@@ -461,9 +480,41 @@ def create_app(
             offset=offset,
         )
 
+    @app.post("/api/v1/projects/{project_id}/agent-prompts", status_code=201)
+    def create_agent_prompt(
+        project_id: str,
+        payload: AgentPromptCreate,
+        request: Request,
+        session: Session = WriteSessionDep,
+    ) -> dict[str, Any]:
+        if request.state.research_monitor_auth != "browser":
+            raise DomainError(
+                403, "browser_auth_required",
+                "Guided requests can be issued only from an authenticated browser session",
+            )
+        return service.create_agent_prompt(session, project_id, payload)
+
+    @app.get("/api/v1/projects/{project_id}/agent-prompts/{intent_id}")
+    def agent_prompt(
+        project_id: str,
+        intent_id: str,
+        request: Request,
+        session: Session = SessionDep,
+    ) -> dict[str, Any]:
+        if request.state.research_monitor_auth != "browser":
+            raise DomainError(
+                403, "browser_auth_required",
+                "Raw guided-request details are available only to an authenticated browser session",
+            )
+        return service.agent_prompt(session, project_id, intent_id)
+
     @app.get("/api/v1/projects/{project_id}/agent-context")
-    def agent_context(project_id: str, session: Session = SessionDep) -> dict[str, Any]:
-        return service.agent_context(session, project_id)
+    def agent_context(
+        project_id: str,
+        intent_id: str | None = Query(None),
+        session: Session = SessionDep,
+    ) -> dict[str, Any]:
+        return service.agent_context(session, project_id, intent_id)
 
     @app.get("/api/v1/projects/{project_id}/export")
     def export_project(project_id: str, output_path: str | None = None, session: Session = SessionDep) -> dict[str, Any]:
@@ -497,8 +548,35 @@ def create_app(
         return service.mutate_layout(session, payload)
 
     @app.get("/api/v1/projects/{project_id}/proposals")
-    def proposals(project_id: str, session: Session = SessionDep) -> dict[str, Any]:
-        return {"proposals": service.proposals(session, project_id)}
+    def proposals(
+        project_id: str,
+        summary: bool | None = Query(None),
+        status: str | None = Query(None, min_length=1, max_length=40),
+        workflow_mode: str | None = Query(None, min_length=1, max_length=80),
+        scope_type: str | None = Query(None, min_length=1, max_length=20),
+        cursor: str | None = Query(None, min_length=1, max_length=2048),
+        limit: int | None = Query(None, ge=1, le=100),
+        session: Session = SessionDep,
+    ) -> dict[str, Any]:
+        # Preserve the released unqualified endpoint for CLI/UI callers that
+        # still expect complete proposal details in one response. Any explicit
+        # paging, filter, or summary parameter selects the bounded v0.2 shape.
+        paged = summary is not None or any(
+            value is not None
+            for value in (status, workflow_mode, scope_type, cursor, limit)
+        )
+        if not paged:
+            return {"proposals": service.proposals(session, project_id)}
+        return service.proposal_page(
+            session,
+            project_id,
+            summary=bool(summary),
+            status=status,
+            workflow_mode=workflow_mode,
+            scope_type=scope_type,
+            cursor=cursor,
+            limit=limit or 20,
+        )
 
     @app.post("/api/v1/projects/{project_id}/proposals/validate")
     def validate_proposal(project_id: str, payload: ProposalEnvelope, session: Session = WriteSessionDep) -> dict[str, Any]:
@@ -542,7 +620,7 @@ def create_app(
             value = service.apply_proposal(session, project_id, proposal_id, payload)
             return JSONResponse(value)
         except DomainError as exc:
-            if exc.code == "revision_conflict":
+            if exc.code in {"revision_conflict", "entity_deleted", "entity_inactive"}:
                 # Returning normally lets the write dependency commit the durable
                 # conflict/operation dispositions before the 409 reaches the UI.
                 return JSONResponse(status_code=exc.status_code, content={"detail": exc.as_detail()})

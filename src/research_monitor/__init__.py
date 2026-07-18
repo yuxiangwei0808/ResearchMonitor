@@ -1,5 +1,7 @@
 """Research Monitor backend package."""
 
-__version__ = "0.1.0"
+from ._version import VERSION
+
+__version__ = VERSION
 API_VERSION = "1"
 SCHEMA_VERSION = "1"

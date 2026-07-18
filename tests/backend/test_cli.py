@@ -585,7 +585,7 @@ def test_forged_current_head_schema_errors_are_structured(
             );
             INSERT INTO schema_versions(version, applied_at) VALUES (1, CURRENT_TIMESTAMP);
             CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL);
-            INSERT INTO alembic_version(version_num) VALUES ('0004');
+            INSERT INTO alembic_version(version_num) VALUES ('0005');
             """
         )
         connection.commit()

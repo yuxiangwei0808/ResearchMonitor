@@ -7,6 +7,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from research_monitor.contracts import CAPABILITIES
 from research_monitor.api import create_app
 from research_monitor.cli import _shared_writer_error, _try_data_access_locks
 from research_monitor.config import process_start_ticks
@@ -87,10 +88,11 @@ def test_version_identity_and_cli_stop_are_bound_to_exact_instance(
         assert version.json() == {
             "api_version": "1",
             "schema_version": "1",
-            "version": "0.1.0",
+            "version": "0.2.0",
             "server_instance_id": "expected-instance",
             "server_pid": os.getpid(),
             "process_start_ticks": process_start_ticks(os.getpid()),
+            "capabilities": CAPABILITIES,
         }
 
         mismatch = client.post(

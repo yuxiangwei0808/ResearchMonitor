@@ -5,8 +5,9 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { api } from '../lib/api'
-import type { ProjectSnapshot, Proposal } from '../types'
-import { ProposalsView } from './ProposalsView'
+import type { ProjectSnapshot, Proposal, ProposalOperation } from '../types'
+import type { GuidedRequestSeed } from '../components/AskCodexDialog'
+import { isHighRiskOperation, ProposalsView } from './ProposalsView'
 
 
 const projectId = '11111111-1111-4111-8111-111111111111'
@@ -100,18 +101,45 @@ function taskCreateOperation(title = 'Agent drafted task'): Proposal['operations
     source_references: [{ path: 'PLAN.md', anchor: 'Task', opaque_key: 'AGENT-01' }],
     prerequisite_operation_ids: [],
     disposition: 'pending',
+    risk: 'normal',
+    default_selected: false,
   }
 }
 
-function renderView(value: Proposal | Proposal[]) {
-  const getProposals = vi.spyOn(api, 'getProposals').mockResolvedValue(Array.isArray(value) ? value : [value])
+function renderView(
+  value: Proposal | Proposal[],
+  onAskCodex?: (seed: GuidedRequestSeed) => void,
+  lazyDetail?: Proposal | Proposal[],
+) {
+  let current = Array.isArray(value) ? value : [value]
+  const details = lazyDetail == null ? null : Array.isArray(lazyDetail) ? lazyDetail : [lazyDetail]
+  const getProposalPage = vi.spyOn(api, 'getProposalPage').mockImplementation(async (_projectId, options = {}) => {
+    const filtered = current.filter((item) => {
+      if (options.status === 'open' && item.status !== 'draft') return false
+      if (options.status === 'closed' && item.status === 'draft') return false
+      if (options.workflowMode && (item.workflow_mode ?? 'legacy_custom') !== options.workflowMode) return false
+      if (options.scopeType && item.scope_type !== options.scopeType) return false
+      return true
+    })
+    return { proposals: filtered, next_cursor: null, total: filtered.length, draft_count: current.filter((item) => item.status === 'draft').length }
+  })
+  vi.spyOn(api, 'getProposal').mockImplementation(async (_projectId, proposalId) => {
+    const found = (details ?? current).find((item) => item.id === proposalId)
+    if (!found) throw new Error('Proposal not found')
+    return found
+  })
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   const view = render(
     <QueryClientProvider client={client}>
-      <ProposalsView snapshot={snapshot} />
+      <ProposalsView snapshot={snapshot} onAskCodex={onAskCodex} />
     </QueryClientProvider>,
   )
-  return { client, getProposals, ...view }
+  return {
+    client,
+    getProposalPage,
+    setProposals: (next: Proposal | Proposal[]) => { current = Array.isArray(next) ? next : [next] },
+    ...view,
+  }
 }
 
 afterEach(() => {
@@ -149,6 +177,18 @@ describe('ProposalsView immutable diffs', () => {
     fireEvent.keyDown(auditTab, { key: 'ArrowRight' })
     expect(document.activeElement).toBe(outlineTab)
     expect(outlineTab.getAttribute('aria-selected')).toBe('true')
+  })
+
+  it('honors server-selected safe v2 operations while legacy drafts remain unselected', async () => {
+    const operation = { ...taskCreateOperation(), default_selected: true, basis: 'source_evidence' as const }
+    const guided = draftProposal(operation, {
+      proposal_contract_version: '2', workflow_mode: 'suggest_next_work', scope_type: 'project', result_kind: 'changes',
+    })
+    renderView(guided)
+    const card = (await screen.findByRole('heading', { name: guided.summary })).closest('article')!
+    fireEvent.click(within(card).getByRole('tab', { name: 'Operation audit' }))
+    expect((within(card).getByRole('checkbox', { name: 'Select Agent drafted task (Task Create)' }) as HTMLInputElement).checked).toBe(true)
+    expect((within(card).getByRole('button', { name: 'Apply 1 selected' }) as HTMLButtonElement).disabled).toBe(false)
   })
 
   it('starts approval empty, stages a named outline edit, and saves the full reviewed draft', async () => {
@@ -207,6 +247,8 @@ describe('ProposalsView immutable diffs', () => {
         user_key: 'AGENT-01',
       }),
     })
+    expect(call[5][0]).not.toHaveProperty('risk')
+    expect(call[5][0]).not.toHaveProperty('default_selected')
   })
 
   it('reuses the same apply request ID when retrying the exact selected-operation payload', async () => {
@@ -220,9 +262,12 @@ describe('ProposalsView immutable diffs', () => {
     const applyButton = within(card).getByRole('button', { name: 'Apply 1 selected' }) as HTMLButtonElement
 
     fireEvent.click(applyButton)
+    const confirmation = await screen.findByRole('dialog', { name: 'Apply selected proposal changes' })
+    const confirmApply = within(confirmation).getByRole('button', { name: 'Apply 1 selected' }) as HTMLButtonElement
+    fireEvent.click(confirmApply)
     await waitFor(() => expect(apply).toHaveBeenCalledTimes(1))
-    await waitFor(() => expect(applyButton.disabled).toBe(false))
-    fireEvent.click(applyButton)
+    await waitFor(() => expect(confirmApply.disabled).toBe(false))
+    fireEvent.click(confirmApply)
     await waitFor(() => expect(apply).toHaveBeenCalledTimes(2))
 
     expect(apply.mock.calls[0].slice(0, 4)).toEqual([projectId, original.id, [operationId], []])
@@ -246,6 +291,8 @@ describe('ProposalsView immutable diffs', () => {
     fireEvent.click(within(card).getByRole('tab', { name: 'Operation audit' }))
     fireEvent.click(within(card).getByRole('checkbox', { name: 'Select Agent drafted task (Task Create)' }))
     fireEvent.click(within(card).getByRole('button', { name: 'Apply 1 selected' }))
+    const confirmation = await screen.findByRole('dialog', { name: 'Apply selected proposal changes' })
+    fireEvent.click(within(confirmation).getByRole('button', { name: 'Apply 1 selected' }))
 
     await waitFor(() => expect(invalidate).toHaveBeenCalledWith({
       queryKey: ['project-search', projectId],
@@ -255,15 +302,18 @@ describe('ProposalsView immutable diffs', () => {
   it('reuses the same reject request ID when retrying the exact reason payload', async () => {
     const original = draftProposal(taskCreateOperation())
     const reject = vi.spyOn(api, 'rejectProposal').mockRejectedValue(new Error('Reject response was lost'))
-    vi.spyOn(window, 'prompt').mockReturnValue('Duplicate task')
     renderView(original)
 
     const card = (await screen.findByRole('heading', { name: original.summary })).closest('article')!
     const rejectButton = within(card).getByRole('button', { name: 'Reject proposal' }) as HTMLButtonElement
     fireEvent.click(rejectButton)
+    const rejection = await screen.findByRole('dialog', { name: 'Reject proposal' })
+    fireEvent.change(within(rejection).getByRole('textbox', { name: 'Reason (optional)' }), { target: { value: 'Duplicate task' } })
+    const confirmReject = within(rejection).getByRole('button', { name: 'Reject proposal' }) as HTMLButtonElement
+    fireEvent.click(confirmReject)
     await waitFor(() => expect(reject).toHaveBeenCalledTimes(1))
-    await waitFor(() => expect(rejectButton.disabled).toBe(false))
-    fireEvent.click(rejectButton)
+    await waitFor(() => expect(confirmReject.disabled).toBe(false))
+    fireEvent.click(confirmReject)
     await waitFor(() => expect(reject).toHaveBeenCalledTimes(2))
 
     expect(reject.mock.calls[0].slice(0, 3)).toEqual([projectId, original.id, 'Duplicate task'])
@@ -431,8 +481,14 @@ describe('ProposalsView immutable diffs', () => {
 
   it('preserves a dirty outline read-only when a query refresh supersedes its server draft', async () => {
     const original = draftProposal(taskCreateOperation())
-    const closed: Proposal = {
+    const summary: Proposal = {
       ...original,
+      operations: [],
+      operation_count: 1,
+      detail_loaded: false,
+    }
+    const closed: Proposal = {
+      ...summary,
       status: 'superseded',
       superseded_by_proposal_id: '77777777-7777-4777-8777-777777777777',
     }
@@ -445,17 +501,23 @@ describe('ProposalsView immutable diffs', () => {
     })
     const revise = vi.spyOn(api, 'reviseProposal').mockResolvedValue(original)
     const reject = vi.spyOn(api, 'rejectProposal').mockResolvedValue()
-    const { client, getProposals } = renderView(original)
+    const { client, setProposals } = renderView(summary, undefined, original)
 
     let card = (await screen.findByRole('heading', { name: original.summary })).closest('article')!
-    fireEvent.click(within(card).getByRole('button', { name: 'Edit task Agent drafted task' }))
+    fireEvent.click(within(card).getByRole('button', { name: 'Review proposal' }))
+    const editTask = await screen.findByRole('button', { name: 'Edit task Agent drafted task' })
+    card = editTask.closest('article')!
+    fireEvent.click(editTask)
     const dialog = screen.getByRole('dialog', { name: 'Edit proposed task' })
     fireEvent.change(within(dialog).getByLabelText('Task title'), { target: { value: 'Recovered superseded edit' } })
     fireEvent.click(within(dialog).getByRole('button', { name: 'Save task changes' }))
     await waitFor(() => expect(window.sessionStorage.length).toBe(1))
 
-    getProposals.mockResolvedValue([closed])
+    setProposals([closed])
     await client.invalidateQueries({ queryKey: ['proposals', projectId] })
+    const viewDetails = await screen.findByRole('button', { name: 'View details' })
+    card = viewDetails.closest('article')!
+    fireEvent.click(viewDetails)
     expect(await screen.findByText('Recovered staged edits conflict with a closed proposal.')).not.toBeNull()
 
     card = screen.getByRole('heading', { name: original.summary }).closest('article')!
@@ -592,5 +654,386 @@ describe('ProposalsView immutable diffs', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Regeneration required' }))
     expect(apply).not.toHaveBeenCalled()
     expect(screen.getByRole('button', { name: 'Copy regeneration prompt' })).not.toBeNull()
+  })
+
+  it('regenerates an intent-bound conflict from the immutable stored intent claims', async () => {
+    const intentId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const conflicted = draftProposal({ ...taskCreateOperation(), basis: 'source_evidence' }, {
+      status: 'conflict',
+      proposal_contract_version: '2',
+      workflow_mode: 'reconcile_progress',
+      scope_type: 'project',
+      scope_id: null,
+      intent_id: intentId,
+      result_kind: 'changes',
+    })
+    const inspectIntent = vi.spyOn(api, 'getAgentPrompt').mockResolvedValue({
+      intent_id: intentId,
+      expires_at: '2026-07-18T00:00:00Z',
+      workflow_mode: 'reconcile_progress',
+      scope_type: 'project',
+      scope_id: null,
+      allow_completion: false,
+      instructions: 'Reconcile only the bounded documented progress.',
+      artifact_locators: [],
+      prompt: 'Stored prompt',
+    })
+    const onAskCodex = vi.fn<(seed: GuidedRequestSeed) => void>()
+    renderView(conflicted, onAskCodex)
+
+    expect(await screen.findByText('This guided proposal conflicted and was not applied.')).not.toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Regenerate guided request' }))
+    await waitFor(() => expect(inspectIntent).toHaveBeenCalledWith(projectId, intentId))
+    expect(onAskCodex).toHaveBeenCalledWith(expect.objectContaining({
+      mode: 'reconcile_progress',
+      scopeType: 'project',
+      instructions: 'Reconcile only the bounded documented progress.',
+      allowCompletion: false,
+      regenerateProposalId: conflicted.id,
+    }))
+  })
+
+  it('loads summary cards first and fetches complete operations only when review is expanded', async () => {
+    const full = draftProposal({ ...taskCreateOperation(), basis: 'source_evidence' }, {
+      proposal_contract_version: '2',
+      workflow_mode: 'suggest_next_work',
+      scope_type: 'project',
+      result_kind: 'changes',
+    })
+    const summary: Proposal = {
+      ...full,
+      operations: [],
+      operation_count: 1,
+      detail_loaded: false,
+      basis_counts: { source_evidence: 1 },
+      risk_counts: { normal: 0, high: 1 },
+      evidence_count: 2,
+    }
+    vi.spyOn(api, 'getProposalPage').mockImplementation(async (_projectId, options = {}) => ({
+      proposals: options.status === 'open' ? [summary] : [],
+      next_cursor: null,
+      total: options.status === 'open' ? 1 : 0,
+    }))
+    const inspect = vi.spyOn(api, 'getProposal').mockResolvedValue(full)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(<QueryClientProvider client={client}><ProposalsView snapshot={snapshot} /></QueryClientProvider>)
+
+    const card = (await screen.findByRole('heading', { name: full.summary })).closest('article')!
+    expect(inspect).not.toHaveBeenCalled()
+    expect(within(card).queryByRole('tab', { name: 'Operation audit' })).toBeNull()
+    expect(within(card).getByText('Source evidence · 1')).not.toBeNull()
+    expect(within(card).getByText('High risk · 1')).not.toBeNull()
+    expect(within(card).getByText('2 top-level evidence items')).not.toBeNull()
+
+    fireEvent.click(within(card).getByRole('button', { name: 'Review proposal' }))
+    await waitFor(() => expect(inspect).toHaveBeenCalledWith(projectId, full.id))
+    expect(await screen.findByRole('tab', { name: 'Operation audit' })).not.toBeNull()
+  })
+
+  it('automatically retrieves every open-draft summary page and sends workflow and scope filters to the server', async () => {
+    const first = { ...draftProposal(taskCreateOperation(), { id: 'open-first', summary: 'First open draft', workflow_mode: 'reconcile_progress', scope_type: 'pipeline', scope_id: pipelineId }), operations: [], operation_count: 1, detail_loaded: false }
+    const second = { ...first, id: 'open-second', summary: 'Second open draft' }
+    const getPage = vi.spyOn(api, 'getProposalPage').mockImplementation(async (_projectId, options = {}) => {
+      if (options.status === 'closed') return { proposals: [], next_cursor: null, total: 0 }
+      if (options.cursor === 'open-next') return { proposals: [second], next_cursor: null, total: 2 }
+      return { proposals: [first], next_cursor: 'open-next', total: 2 }
+    })
+    vi.spyOn(api, 'getProposal').mockRejectedValue(new Error('Details should remain lazy'))
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(<QueryClientProvider client={client}><ProposalsView snapshot={snapshot} /></QueryClientProvider>)
+
+    expect(await screen.findByRole('heading', { name: 'Second open draft' })).not.toBeNull()
+    expect(getPage).toHaveBeenCalledWith(projectId, expect.objectContaining({ status: 'open', cursor: 'open-next', limit: 100, summary: true }))
+
+    fireEvent.change(screen.getByLabelText('Workflow'), { target: { value: 'reconcile_progress' } })
+    fireEvent.change(await screen.findByLabelText('Scope'), { target: { value: 'pipeline' } })
+    await waitFor(() => expect(getPage).toHaveBeenCalledWith(projectId, expect.objectContaining({ workflowMode: 'reconcile_progress', scopeType: 'pipeline' })))
+  })
+
+  it('shows only the newest history page initially and loads older summaries by cursor without inspecting details', async () => {
+    const closedSummary = (index: number): Proposal => ({
+      ...proposal(taskCreateOperation()),
+      id: `closed-${index}`,
+      summary: `Closed result ${index}`,
+      operations: [],
+      operation_count: 1,
+      detail_loaded: false,
+      workflow_mode: 'legacy_custom',
+      scope_type: 'project',
+    })
+    const newest = Array.from({ length: 20 }, (_, index) => closedSummary(index + 1))
+    const older = closedSummary(21)
+    const getPage = vi.spyOn(api, 'getProposalPage').mockImplementation(async (_projectId, options = {}) => {
+      if (options.status === 'open') return { proposals: [], next_cursor: null, total: 0 }
+      if (options.cursor === 'older-page') return { proposals: [older], next_cursor: null, total: 21 }
+      return { proposals: newest, next_cursor: 'older-page', total: 21 }
+    })
+    const inspect = vi.spyOn(api, 'getProposal').mockRejectedValue(new Error('Details should remain lazy'))
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(<QueryClientProvider client={client}><ProposalsView snapshot={snapshot} /></QueryClientProvider>)
+
+    expect(await screen.findByRole('heading', { name: 'Closed result 20' })).not.toBeNull()
+    expect(screen.queryByRole('heading', { name: 'Closed result 21' })).toBeNull()
+    expect(screen.getByText('20 of 21 history results loaded')).not.toBeNull()
+    expect(inspect).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Load 20 older results' }))
+    expect(await screen.findByRole('heading', { name: 'Closed result 21' })).not.toBeNull()
+    expect(getPage).toHaveBeenCalledWith(projectId, expect.objectContaining({ status: 'closed', cursor: 'older-page', limit: 20, summary: true }))
+    expect(inspect).not.toHaveBeenCalled()
+  })
+
+  it('renders no-change top-level evidence and source references as safe text', async () => {
+    const report: Proposal = {
+      ...proposal(taskCreateOperation()),
+      id: '90909090-9090-4090-8090-909090909090',
+      summary: 'Bounded scan found no monitor changes',
+      status: 'no_changes',
+      result_kind: 'no_changes',
+      no_change_reason: 'up_to_date',
+      workflow_mode: 'reconcile_progress',
+      scope_type: 'project',
+      proposal_contract_version: '2',
+      operations: [],
+      operation_count: 0,
+      detail_loaded: true,
+      scan_summary: { files_scanned: 4, text_bytes: 1024 },
+      top_level_evidence: [{
+        kind: 'source_text',
+        summary: '<img src=x onerror=alert(1)> remains literal evidence text',
+        locator: 'PROGRESS.md#Results',
+        content_hash: 'sha256:safe',
+      }],
+      source_references: [{ path: 'PROGRESS.md', anchor: 'Results', fingerprint: 'sha256:safe' }],
+    }
+    renderView(report)
+
+    const evidence = await screen.findByRole('region', { name: 'No-change evidence' })
+    expect(within(evidence).getByText('<img src=x onerror=alert(1)> remains literal evidence text')).not.toBeNull()
+    expect(within(evidence).getByText(/Source Text · PROGRESS.md#Results/)).not.toBeNull()
+    expect(within(evidence).getByText(/source · PROGRESS.md#Results · fingerprint sha256:safe/)).not.toBeNull()
+    expect(evidence.querySelector('img')).toBeNull()
+  })
+
+  it('loads real-shaped no-change summary evidence lazily and retries a failed detail request', async () => {
+    const full: Proposal = {
+      ...proposal(taskCreateOperation()),
+      id: '91919191-9191-4191-8191-919191919191',
+      summary: 'No changes after bounded review',
+      status: 'no_changes',
+      result_kind: 'no_changes',
+      no_change_reason: 'up_to_date',
+      workflow_mode: 'reconcile_progress',
+      scope_type: 'project',
+      proposal_contract_version: '2',
+      operations: [],
+      operation_count: 0,
+      detail_loaded: true,
+      scan_summary: { files_scanned: 2, text_bytes: 800 },
+      top_level_evidence: [{ kind: 'source_text', summary: 'The tracker matches the monitor.', locator: 'PROGRESS.md#Current', content_hash: 'sha256:current' }],
+      source_references: [{ path: 'PROGRESS.md', anchor: 'Current', fingerprint: 'sha256:current' }],
+    }
+    const summary: Proposal = {
+      ...full,
+      detail_loaded: undefined,
+      top_level_evidence: undefined,
+      source_references: undefined,
+      evidence_count: 1,
+      source_reference_count: 1,
+    }
+    vi.spyOn(api, 'getProposalPage').mockImplementation(async (_projectId, options = {}) => ({
+      proposals: options.status === 'closed' ? [summary] : [], next_cursor: null, total: options.status === 'closed' ? 1 : 0,
+    }))
+    const inspect = vi.spyOn(api, 'getProposal').mockRejectedValueOnce(new Error('Temporary detail failure')).mockResolvedValue(full)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(<QueryClientProvider client={client}><ProposalsView snapshot={snapshot} /></QueryClientProvider>)
+
+    const card = (await screen.findByRole('heading', { name: summary.summary })).closest('article')!
+    expect(within(card).queryByRole('region', { name: 'No-change evidence' })).toBeNull()
+    fireEvent.click(within(card).getByRole('button', { name: 'View report' }))
+    expect(await within(card).findByText('Unable to load proposal details.')).not.toBeNull()
+    fireEvent.click(within(card).getByRole('button', { name: 'Try again' }))
+    const evidence = await screen.findByRole('region', { name: 'No-change evidence' })
+    expect(within(evidence).getByText('The tracker matches the monitor.')).not.toBeNull()
+    expect(inspect).toHaveBeenCalledTimes(2)
+  })
+
+  it('preserves canonical high risk for badges and selected-operation confirmation counts', async () => {
+    const highRisk: Proposal['operations'][number] = {
+      id: 'high-risk-pipeline-update',
+      type: 'pipeline.update',
+      entity_id: pipelineId,
+      expected_version: 2,
+      data: { title: 'Canonical high-risk edit' },
+      rationale: 'Server classified this shared planning edit as high risk.',
+      confidence: 0.9,
+      prerequisite_operation_ids: [],
+      disposition: 'pending',
+      basis: 'source_evidence',
+      risk: 'high',
+      default_selected: true,
+    }
+    const guided = draftProposal(highRisk, {
+      proposal_contract_version: '2', workflow_mode: 'suggest_next_work', scope_type: 'project', result_kind: 'changes',
+    })
+    renderView(guided)
+    const card = (await screen.findByRole('heading', { name: guided.summary })).closest('article')!
+    fireEvent.click(within(card).getByRole('tab', { name: 'Operation audit' }))
+    fireEvent.click(within(card).getByRole('button', { name: /Canonical high-risk edit/ }))
+    fireEvent.click(within(card).getByRole('button', { name: 'Edit' }))
+    const editor = await screen.findByRole('dialog', { name: 'Edit Pipeline Update' })
+    fireEvent.change(within(editor).getByLabelText('Operation data (JSON)'), { target: { value: JSON.stringify({ title: 'Edited high-risk pipeline' }) } })
+    fireEvent.click(within(editor).getByRole('button', { name: 'Save operation edit' }))
+    expect(within(card).getByText('High risk · 1', { exact: true })).not.toBeNull()
+    expect(within(card).getByText('1 of 1 selected · 1 high risk', { exact: true })).not.toBeNull()
+    fireEvent.click(within(card).getByRole('button', { name: 'Discard edits' }))
+    fireEvent.click(within(card).getByRole('checkbox', { name: 'Select Canonical high-risk edit (Pipeline Update)' }))
+    fireEvent.click(within(card).getByRole('button', { name: 'Apply 1 selected' }))
+    const confirmation = await screen.findByRole('dialog', { name: 'Apply selected proposal changes' })
+    expect(within(confirmation).getByText('High-risk operations').nextElementSibling?.textContent).toBe('1')
+  })
+
+  it('reclassifies a normal server operation when an unsaved task edit becomes high risk', async () => {
+    const normalUpdate: Proposal['operations'][number] = {
+      id: 'normal-task-update',
+      type: 'task.update',
+      entity_id: taskId,
+      expected_version: 1,
+      data: { title: 'Initially normal task edit' },
+      rationale: 'The initial title-only edit is normal risk.',
+      confidence: 0.9,
+      prerequisite_operation_ids: [],
+      disposition: 'pending',
+      basis: 'source_evidence',
+      risk: 'normal',
+      default_selected: true,
+    }
+    const guided = draftProposal(normalUpdate, {
+      proposal_contract_version: '2', workflow_mode: 'reconcile_progress', scope_type: 'task', scope_id: taskId, result_kind: 'changes',
+    })
+    renderView(guided)
+    const card = (await screen.findByRole('heading', { name: guided.summary })).closest('article')!
+    fireEvent.click(within(card).getByRole('tab', { name: 'Operation audit' }))
+    expect(within(card).queryByText('High risk · 1', { exact: true })).toBeNull()
+    fireEvent.click(within(card).getByRole('button', { name: /Initially normal task edit/ }))
+    fireEvent.click(within(card).getByRole('button', { name: 'Edit' }))
+    const editor = await screen.findByRole('dialog', { name: 'Edit Task Update' })
+    fireEvent.change(within(editor).getByLabelText('Operation data (JSON)'), { target: { value: JSON.stringify({ title: 'Now records an outcome', outcome: 'negative' }) } })
+    fireEvent.click(within(editor).getByRole('button', { name: 'Save operation edit' }))
+    expect(within(card).getByText('High risk · 1', { exact: true })).not.toBeNull()
+    expect(within(card).getByText('1 of 1 selected · 1 high risk', { exact: true })).not.toBeNull()
+    expect((within(card).getByRole('button', { name: 'Save draft before applying' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('mirrors canonical high-risk rules for unsaved task creates, structural updates, and waived edges', () => {
+    const operation = (type: string, data: Record<string, unknown>): ProposalOperation => ({
+      id: `${type}-${JSON.stringify(data)}`,
+      type,
+      data,
+      rationale: 'Classifier parity fixture.',
+      confidence: 0.9,
+      prerequisite_operation_ids: [],
+      disposition: 'pending',
+    })
+    const highRisk = [
+      operation('task.create', { status: 'done' }),
+      operation('task.create', { status: 'dropped' }),
+      operation('task.create', { outcome: 'negative' }),
+      operation('task.create', { completion_summary: 'completed' }),
+      operation('task.create', { completion_provenance: 'agent' }),
+      operation('task.update', { pipeline_id: pipelineId }),
+      operation('task.update', { parent_id: taskId }),
+      operation('task.update', { position: 3 }),
+      operation('task.update', { child_flow_mode: 'sequential' }),
+      operation('task.update', { completion_provenance: 'manual' }),
+      operation('edge.create', { disabled: true }),
+      operation('edge.create', { waiver_reason: 'Human-approved waiver' }),
+    ]
+    highRisk.forEach((candidate) => expect(isHighRiskOperation(candidate)).toBe(true))
+
+    expect(isHighRiskOperation(operation('task.create', {
+      status: 'planned',
+      outcome: 'not_applicable',
+      pipeline_id: pipelineId,
+      parent_id: taskId,
+      position: 1,
+      child_flow_mode: 'sequential',
+    }))).toBe(false)
+    expect(isHighRiskOperation(operation('edge.create', { disabled: false, waiver_reason: '' }))).toBe(false)
+  })
+
+  it('separates explicit selections from prerequisite and atomic closure and counts operation types', async () => {
+    const prerequisite: Proposal['operations'][number] = {
+      id: 'op-prerequisite-pipeline',
+      type: 'pipeline.create',
+      entity_id: '10101010-1010-4010-8010-101010101010',
+      data: { id: '10101010-1010-4010-8010-101010101010', title: 'Prerequisite pipeline', flow_mode: 'freeform', position: 1 },
+      prerequisite_operation_ids: [],
+      disposition: 'pending',
+      default_selected: false,
+    }
+    const artifact: Proposal['operations'][number] = {
+      id: 'op-atomic-artifact',
+      type: 'artifact.create',
+      entity_id: '20202020-2020-4020-8020-202020202020',
+      data: { id: '20202020-2020-4020-8020-202020202020', title: 'Result artifact' },
+      atomic_group_id: 'artifact-link-group',
+      prerequisite_operation_ids: [],
+      disposition: 'pending',
+      default_selected: false,
+    }
+    const link: Proposal['operations'][number] = {
+      id: 'op-explicit-link',
+      type: 'task_artifact.create',
+      entity_id: '30303030-3030-4030-8030-303030303030',
+      data: { id: '30303030-3030-4030-8030-303030303030', title: 'Attach result', task_id: taskId, artifact_id: artifact.entity_id, role: 'result' },
+      atomic_group_id: 'artifact-link-group',
+      prerequisite_operation_ids: [prerequisite.id],
+      disposition: 'pending',
+      default_selected: false,
+    }
+    const guided = draftProposal(link, {
+      operations: [prerequisite, artifact, link],
+      proposal_contract_version: '2',
+      workflow_mode: 'link_artifacts',
+      scope_type: 'task',
+      scope_id: taskId,
+      result_kind: 'changes',
+    })
+    renderView(guided)
+
+    const card = (await screen.findByRole('heading', { name: guided.summary })).closest('article')!
+    fireEvent.click(within(card).getByRole('tab', { name: 'Operation audit' }))
+    fireEvent.click(within(card).getByRole('checkbox', { name: 'Select Attach result (Task Artifact Create)' }))
+    expect(within(card).getByRole('button', { name: 'Apply 3 selected' })).not.toBeNull()
+    fireEvent.click(within(card).getByRole('button', { name: 'Apply 3 selected' }))
+
+    const confirmation = await screen.findByRole('dialog', { name: 'Apply selected proposal changes' })
+    expect(within(confirmation).getByText('Explicit selections').nextElementSibling?.textContent).toBe('1')
+    expect(within(confirmation).getByText('Automatically included').nextElementSibling?.textContent).toContain('2')
+    expect(within(confirmation).getByText(/1 prerequisite closure/)).not.toBeNull()
+    expect(within(confirmation).getByText(/1 atomic-group closure/)).not.toBeNull()
+    expect(within(confirmation).getByText('Selected by operation type').nextElementSibling?.textContent).toBe('Artifact Create: 1 · Pipeline Create: 1 · Task Artifact Create: 1')
+
+    fireEvent.click(within(confirmation).getByRole('button', { name: 'Cancel' }))
+    fireEvent.click(within(card).getByRole('checkbox', { name: 'Select Prerequisite pipeline (Pipeline Create)' }))
+    expect(within(card).getByRole('button', { name: 'Apply 0 selected' })).not.toBeNull()
+  })
+
+  it('renders immutable regeneration lineage separately from graphical revision lineage', async () => {
+    const priorId = 'abababab-abab-4bab-8bab-abababababab'
+    const regenerated = draftProposal(taskCreateOperation(), {
+      proposal_contract_version: '2',
+      workflow_mode: 'suggest_next_work',
+      scope_type: 'project',
+      result_kind: 'changes',
+      regenerates_proposal_id: priorId,
+    })
+    renderView(regenerated)
+
+    const card = (await screen.findByRole('heading', { name: regenerated.summary })).closest('article')!
+    expect(within(card).getByText((_content, element) => element?.tagName === 'STRONG' && element.textContent === `Regenerated from ${priorId}.`)).not.toBeNull()
+    expect(within(card).getByText(priorId, { selector: 'code' })).not.toBeNull()
+    expect(within(card).queryByText('Human-reviewed replacement draft.')).toBeNull()
   })
 })

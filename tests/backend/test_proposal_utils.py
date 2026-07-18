@@ -51,6 +51,7 @@ def test_agent_authority_and_completion_evidence() -> None:
         [{"kind": "code", "summary": "The implementation exists.", "locator": "train.py"}],
         [{"kind": "smoke_test", "summary": "The command exited successfully."}],
         [{"kind": "external_url", "summary": "A run URL exists.", "locator": "https://wandb.ai/run"}],
+        [{"kind": "result_evidence", "summary": "A path alone is not proof.", "locator": "result.json"}],
     ]
     for evidence in invalid_evidence:
         with pytest.raises(DomainError) as error:
@@ -75,18 +76,25 @@ def test_agent_authority_and_completion_evidence() -> None:
             "locator": "TRACKER.md#TASK-1",
         },
         {
-            "kind": "user_instruction",
-            "summary": "The user directly confirmed this exact task is complete.",
-        },
-        {
             "kind": "result_evidence",
             "summary": "The final metrics contain the planned comparison and outcome.",
-            "locator": "results/final-metrics.json",
+            "artifact_id": str(uuid4()),
         },
     ],
 )
 def test_agent_completion_accepts_only_explicit_proof_categories(evidence: dict) -> None:
     validate_agent_operations([completion_operation(evidence=[evidence])])
+
+
+def test_unbound_user_instruction_cannot_prove_agent_completion() -> None:
+    with pytest.raises(DomainError) as error:
+        validate_agent_operations([
+            completion_operation(evidence=[{
+                "kind": "user_instruction",
+                "summary": "The user directly confirmed this exact task is complete.",
+            }])
+        ])
+    assert error.value.code == "completion_evidence_required"
 
 
 def test_agent_completion_requires_summary_independently() -> None:

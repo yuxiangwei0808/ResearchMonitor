@@ -23,11 +23,13 @@ from .models import (
     Artifact,
     GraphViewport,
     ArtifactRoot,
+    AgentIntent,
     AuditEvent,
     IdempotencyRecord,
     JournalEntry,
     OutboxEvent,
     Pipeline,
+    PlanningProfile,
     Project,
     Proposal,
     ProposalOperation,
@@ -58,7 +60,9 @@ SEARCH_ENTITY_TYPES = {"task", "journal", "artifact"}
 READINESS_STATES = {"ready", "waiting", "blocked", "inconsistent"}
 SNAPSHOT_SECTIONS = {
     "project",
+    "automation_state",
     "scan_policy",
+    "planning_profile",
     "artifact_roots",
     "pipelines",
     "tasks",
@@ -73,12 +77,13 @@ SNAPSHOT_SECTIONS = {
 
 DEFAULT_EXCLUDES = [
     "**/.git/**", "**/.env*", "**/.ssh/**", "**/.aws/**", "**/.gnupg/**",
-    "**/*credential*", "**/*token*", "**/*.key",
-    "**/*.pem", "**/node_modules/**", "**/.venv/**", "**/venv/**", "**/data/**",
+    "**/*credential*", "**/*token*", "**/*cert*", "**/*.key",
+    "**/*.pem", "**/*.p12", "**/*.pfx", "**/*.crt", "**/*.cer", "**/*.der",
+    "**/node_modules/**", "**/.venv/**", "**/venv/**", "**/data/**",
     "**/checkpoints/**", "**/wandb/**", "**/mlruns/**",
 ]
 DEFAULT_SENSITIVE = [
-    ".env", ".ssh", ".aws", ".gnupg", "credential", "credentials", "secret", "token", ".key", ".pem", ".p12", ".pfx",
+    ".env", ".ssh", ".aws", ".gnupg", "credential", "credentials", "secret", "token", "cert", "certificate", ".key", ".pem", ".p12", ".pfx", ".crt", ".cer", ".der",
 ]
 
 
@@ -176,6 +181,10 @@ def _public_project(project: Project) -> dict[str, Any]:
         trashed=project.trashed_at is not None,
         unavailable=value["availability"] != "available",
         last_manual_update=jsonable(project.last_manual_update_at),
+        # New clients use the same public version key as every other semantic
+        # entity. Keep entity_version for compatibility with released v1
+        # callers and exports.
+        version=project.entity_version,
     )
     return value
 
@@ -215,6 +224,12 @@ def _public_edge(item: TaskEdge) -> dict[str, Any]:
 def _public_scan_policy(item: ScanPolicy) -> dict[str, Any]:
     value = model_dict(item, exclude={"project_id"})
     value["max_text_file_size"] = value.pop("max_text_bytes")
+    value["version"] = value.pop("entity_version")
+    return value
+
+
+def _public_planning_profile(item: PlanningProfile) -> dict[str, Any]:
+    value = model_dict(item, exclude={"project_id", "created_at", "updated_at"})
     value["version"] = value.pop("entity_version")
     return value
 
@@ -323,6 +338,7 @@ class ResearchMonitorService:
                 sensitive_patterns_json=canonical_json(DEFAULT_SENSITIVE),
             )
         )
+        session.add(PlanningProfile(project_id=project.id))
         session.add(
             ArtifactRoot(
                 id=str(uuid4()), project_id=project.id, alias="Project root",
@@ -469,6 +485,42 @@ class ResearchMonitorService:
         )
         policy = session.get(ScanPolicy, project.id)
         assert policy is not None
+        profile = session.get(PlanningProfile, project.id)
+        profile = profile or PlanningProfile(project_id=project.id)
+        automation_state: dict[str, int] | None = None
+        if "automation_state" in requested:
+            now = utcnow()
+            automation_state = {
+                "active_intent_count": int(
+                    session.scalar(
+                        select(func.count())
+                        .select_from(AgentIntent)
+                        .where(
+                            AgentIntent.project_id == project.id,
+                            AgentIntent.expires_at > now,
+                            AgentIntent.consumed_proposal_id.is_(None),
+                            AgentIntent.issued_semantic_revision
+                            == project.semantic_revision,
+                            AgentIntent.planning_profile_version
+                            == profile.entity_version,
+                        )
+                    )
+                    or 0
+                ),
+                "open_draft_count": int(
+                    session.scalar(
+                        select(func.count())
+                        .select_from(Proposal)
+                        .where(
+                            Proposal.project_id == project.id,
+                            Proposal.status == "draft",
+                            Proposal.base_semantic_revision
+                            == project.semantic_revision,
+                        )
+                    )
+                    or 0
+                ),
+            }
         descendant_map = descendants(tasks)
         task_values = []
         for item in tasks:
@@ -489,7 +541,13 @@ class ResearchMonitorService:
             task_values.append(value)
         return {
             "project": _public_project(project),
+            "automation_state": automation_state,
             "scan_policy": _public_scan_policy(policy),
+            "planning_profile": (
+                _public_planning_profile(profile)
+                if "planning_profile" in requested
+                else None
+            ),
             "artifact_roots": [_public_artifact_root(item) for item in roots],
             "pipelines": [_public_pipeline(item) for item in pipelines] if "pipelines" in requested else [],
             "tasks": task_values if "tasks" in requested else [],
@@ -762,6 +820,7 @@ class ResearchMonitorService:
     def semantic_operation_types() -> set[str]:
         return {
             "project.update", "project.archive", "project.trash", "project.restore", "project.relink",
+            "planning_profile.update",
             "scan_policy.update", "pipeline.create", "pipeline.update", "pipeline.archive",
             "pipeline.delete", "pipeline.restore", "task.create", "task.update", "task.move",
             "task.delete", "task.restore", "edge.create", "edge.update", "edge.delete",

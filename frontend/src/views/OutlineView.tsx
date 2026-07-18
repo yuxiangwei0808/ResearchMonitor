@@ -3,7 +3,7 @@ import { DndContext, KeyboardSensor, PointerSensor, useDraggable, useDroppable, 
 import { CSS } from '@dnd-kit/utilities'
 import { useQuery } from '@tanstack/react-query'
 import { Link, useSearchParams } from 'react-router-dom'
-import { Archive, ArrowDown, ArrowLeftFromLine, ArrowRightFromLine, ArrowUp, Ban, CheckCircle2, ChevronDown, ChevronRight, Circle, CircleDot, Edit3, ExternalLink, FileText, GitBranch, GripVertical, ListFilter, Milestone, MoreHorizontal, Plus, RotateCcw, Search, Trash2 } from 'lucide-react'
+import { Archive, ArrowDown, ArrowLeftFromLine, ArrowRightFromLine, ArrowUp, Ban, CheckCircle2, ChevronDown, ChevronRight, Circle, CircleDot, Edit3, ExternalLink, FileText, GitBranch, GripVertical, ListFilter, Milestone, MoreHorizontal, Plus, RotateCcw, Search, Sparkles, Trash2 } from 'lucide-react'
 import { clsx } from 'clsx'
 import type { JournalEntry, Pipeline, ProjectSnapshot, Task, TaskKind, TaskOutcome, TaskPriority, TaskStatus } from '../types'
 import { ARTIFACT_ROLES, TASK_KINDS, TASK_OUTCOMES, TASK_PRIORITIES, TASK_STATUSES } from '../types'
@@ -15,6 +15,7 @@ import { requestCloseWithUnsavedChanges } from '../lib/unsavedChanges'
 import { Badge, Button, Dialog, EmptyState, Field, Notice } from '../components/ui'
 import { SafeMarkdown } from '../components/SafeMarkdown'
 import { TaskActionsButton, TaskContextRegion } from '../components/TaskActions'
+import type { GuidedRequestSeed } from '../components/AskCodexDialog'
 
 const statusIcons: Record<TaskStatus, React.ComponentType<{ size?: number }>> = {
   planned: Circle,
@@ -66,7 +67,7 @@ function toDraft(task?: Task): TaskDraft {
   }
 }
 
-export function OutlineView({ snapshot }: { snapshot: ProjectSnapshot }) {
+export function OutlineView({ snapshot, onAskCodex }: { snapshot: ProjectSnapshot; onAskCodex?: (seed: GuidedRequestSeed) => void }) {
   const mutation = useProjectMutation(snapshot)
   const [params, setParams] = useSearchParams()
   const [search, setSearch] = useState(params.get('q') ?? '')
@@ -301,9 +302,10 @@ export function OutlineView({ snapshot }: { snapshot: ProjectSnapshot }) {
                   <Button size="icon" variant="ghost" onClick={() => movePipeline(pipeline, -1)} aria-label={`Move ${pipeline.title} up`}><ArrowUp size={14} /></Button>
                   <Button size="icon" variant="ghost" onClick={() => movePipeline(pipeline, 1)} aria-label={`Move ${pipeline.title} down`}><ArrowDown size={14} /></Button>
                   <Button size="icon" variant="ghost" onClick={() => setTaskDialog({ open: true, pipelineId: pipeline.id, parentId: null })} aria-label={`Add task to ${pipeline.title}`}><Plus size={17} /></Button>
+                  {onAskCodex && <Button size="icon" variant="ghost" onClick={() => onAskCodex({ mode: 'suggest_next_work', scopeType: 'pipeline', scopeId: pipeline.id })} aria-label={`Ask Codex about ${pipeline.title}`}><Sparkles size={16} /></Button>}
                   <Button size="icon" variant="ghost" onClick={() => setPipelineDialog({ open: true, pipeline })} aria-label={`Edit ${pipeline.title}`}><Edit3 size={16} /></Button>
                 </header>
-                {!collapsed.has(`pipeline:${pipeline.id}`) && <div className="task-tree">{roots.map((task) => <TaskRow key={task.id} task={task} depth={0} children={children} visible={visible} collapsed={collapsed} setCollapsed={setCollapsed} onEdit={(item) => setTaskDialog({ open: true, task: item })} onAddChild={(item) => setTaskDialog({ open: true, pipelineId: item.pipeline_id, parentId: item.id })} onDelete={deleteTask} onMove={moveTask} onStatus={updateStatus} />)}{!roots.length && <div className="pipeline-empty"><p>{search || filter !== 'all' ? 'No tasks match this view.' : 'This pipeline is empty.'}</p><Button variant="ghost" size="sm" onClick={() => setTaskDialog({ open: true, pipelineId: pipeline.id, parentId: null })}><Plus size={15} />Add task</Button></div>}</div>}
+                {!collapsed.has(`pipeline:${pipeline.id}`) && <div className="task-tree">{roots.map((task) => <TaskRow key={task.id} task={task} depth={0} children={children} visible={visible} collapsed={collapsed} setCollapsed={setCollapsed} onEdit={(item) => setTaskDialog({ open: true, task: item })} onAddChild={(item) => setTaskDialog({ open: true, pipelineId: item.pipeline_id, parentId: item.id })} onDelete={deleteTask} onMove={moveTask} onStatus={updateStatus} onAskCodex={onAskCodex} />)}{!roots.length && <div className="pipeline-empty"><p>{search || filter !== 'all' ? 'No tasks match this view.' : 'This pipeline is empty.'}</p><Button variant="ghost" size="sm" onClick={() => setTaskDialog({ open: true, pipelineId: pipeline.id, parentId: null })}><Plus size={15} />Add task</Button></div>}</div>}
               </section>
             )
           })}
@@ -318,8 +320,8 @@ export function OutlineView({ snapshot }: { snapshot: ProjectSnapshot }) {
   )
 }
 
-function TaskRow({ task, depth, children, visible, collapsed, setCollapsed, onEdit, onAddChild, onDelete, onMove, onStatus }: {
-  task: Task; depth: number; children: Map<string, Task[]>; visible: (task: Task) => boolean; collapsed: Set<string>; setCollapsed: React.Dispatch<React.SetStateAction<Set<string>>>; onEdit: (task: Task) => void; onAddChild: (task: Task) => void; onDelete: (task: Task) => void; onMove: (task: Task, action: 'up' | 'down' | 'indent' | 'outdent') => void; onStatus: (task: Task, status: TaskStatus) => void
+function TaskRow({ task, depth, children, visible, collapsed, setCollapsed, onEdit, onAddChild, onDelete, onMove, onStatus, onAskCodex }: {
+  task: Task; depth: number; children: Map<string, Task[]>; visible: (task: Task) => boolean; collapsed: Set<string>; setCollapsed: React.Dispatch<React.SetStateAction<Set<string>>>; onEdit: (task: Task) => void; onAddChild: (task: Task) => void; onDelete: (task: Task) => void; onMove: (task: Task, action: 'up' | 'down' | 'indent' | 'outdent') => void; onStatus: (task: Task, status: TaskStatus) => void; onAskCodex?: (seed: GuidedRequestSeed) => void
 }) {
   const descendants = (children.get(task.id) ?? []).filter(visible)
   const hasChildren = (children.get(task.id) ?? []).length > 0
@@ -330,7 +332,7 @@ function TaskRow({ task, depth, children, visible, collapsed, setCollapsed, onEd
   const setRefs = (node: HTMLDivElement | null) => { setDragRef(node); setDropRef(node) }
   return (
     <div className={clsx('task-branch', isDragging && 'dragging', isOver && !isDragging && 'drop-target')}>
-      <TaskContextRegion task={task} onEdit={() => onEdit(task)} onAddSubtask={() => onAddChild(task)} onDelete={() => onDelete(task)}>
+      <TaskContextRegion task={task} onEdit={() => onEdit(task)} onAddSubtask={() => onAddChild(task)} onDelete={() => onDelete(task)} onAskCodex={onAskCodex ? () => onAskCodex({ mode: 'expand_task', scopeType: 'task', scopeId: task.id }) : undefined}>
       <div ref={setRefs} className="task-row" style={{ '--depth': depth, transform: CSS.Translate.toString(transform) } as React.CSSProperties}>
         <button type="button" className="drag-handle" title="Drag to reorder" aria-label={`Drag ${task.title} to reorder`} {...listeners} {...attributes}><GripVertical size={15} /></button>
         <button className={clsx('collapse-button', !hasChildren && 'invisible')} aria-label={`${collapsed.has(task.id) ? 'Expand' : 'Collapse'} ${task.title}`} aria-expanded={hasChildren ? !collapsed.has(task.id) : undefined} onClick={() => setCollapsed((previous) => toggleSet(previous, task.id))}>{collapsed.has(task.id) ? <ChevronRight size={17} /> : <ChevronDown size={17} />}</button>
@@ -345,10 +347,10 @@ function TaskRow({ task, depth, children, visible, collapsed, setCollapsed, onEd
           <Button size="icon" variant="ghost" onClick={() => onMove(task, 'indent')} aria-label={`Indent ${task.title}`}><ArrowRightFromLine size={14} /></Button>
           <Button size="icon" variant="ghost" onClick={() => onAddChild(task)} aria-label={`Add subtask to ${task.title}`}><Plus size={15} /></Button>
         </div>
-        <TaskActionsButton task={task} onEdit={() => onEdit(task)} onAddSubtask={() => onAddChild(task)} onDelete={() => onDelete(task)} />
+        <TaskActionsButton task={task} onEdit={() => onEdit(task)} onAddSubtask={() => onAddChild(task)} onDelete={() => onDelete(task)} onAskCodex={onAskCodex ? () => onAskCodex({ mode: 'expand_task', scopeType: 'task', scopeId: task.id }) : undefined} />
       </div>
       </TaskContextRegion>
-      {hasChildren && !collapsed.has(task.id) && <div className="task-children">{descendants.map((child) => <TaskRow key={child.id} task={child} depth={depth + 1} children={children} visible={visible} collapsed={collapsed} setCollapsed={setCollapsed} onEdit={onEdit} onAddChild={onAddChild} onDelete={onDelete} onMove={onMove} onStatus={onStatus} />)}</div>}
+      {hasChildren && !collapsed.has(task.id) && <div className="task-children">{descendants.map((child) => <TaskRow key={child.id} task={child} depth={depth + 1} children={children} visible={visible} collapsed={collapsed} setCollapsed={setCollapsed} onEdit={onEdit} onAddChild={onAddChild} onDelete={onDelete} onMove={onMove} onStatus={onStatus} onAskCodex={onAskCodex} />)}</div>}
     </div>
   )
 }

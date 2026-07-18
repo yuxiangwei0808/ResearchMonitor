@@ -14,6 +14,7 @@ import research_monitor.cli as cli_module
 from research_monitor.cli import app
 from research_monitor.database import reset_database_singleton
 from research_monitor.mutations import operation_integrity_error
+from research_monitor.service import DomainError
 
 from .conftest import enroll
 
@@ -31,6 +32,21 @@ def _mutation(project: dict, revision: int, operation: dict) -> dict:
         "actor_type": "ui",
         "operations": [operation],
     }
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "intent_stale",
+        "revision_conflict",
+        "entity_version_conflict",
+        "entity_deleted",
+        "entity_inactive",
+    ],
+)
+def test_semantic_conflicts_map_to_revision_conflict_exit_code(code: str) -> None:
+    error = DomainError(409, code, "Prepared monitor state is stale")
+    assert cli_module._exit_for(error) == 4
 
 
 def test_offline_cli_incompatible_database_has_common_envelope_and_exit_5(

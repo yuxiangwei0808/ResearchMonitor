@@ -19,7 +19,8 @@ OPERATION_STRING_FIELDS = {
     "completion_actor", "completion_source", "completion_override_reason",
     "child_flow_mode", "edge_type", "waiver_reason", "entry_type", "content",
     "occurred_at", "canonical_path", "root_path", "locator", "provider", "label",
-    "notes", "role",
+    "notes", "role", "task_granularity", "planning_horizon", "inference_policy",
+    "terminology_notes", "additional_instructions",
 }
 OPERATION_UUID_FIELDS = {
     "id", "pipeline_id", "parent_id", "source_task_id", "source_id",
@@ -28,11 +29,16 @@ OPERATION_UUID_FIELDS = {
 OPERATION_NUMBER_FIELDS = {"position", "x", "y", "zoom"}
 OPERATION_BOOLEAN_FIELDS = {
     "allow_git_metadata", "allow_outside_sources", "cascade", "disabled",
+    "allow_completion",
 }
-OPERATION_INTEGER_FIELDS = {"max_text_file_size", "git_history_limit"}
+OPERATION_INTEGER_FIELDS = {
+    "max_text_file_size", "git_history_limit", "max_files_per_scan",
+    "max_total_text_bytes", "max_nesting_depth", "max_new_tasks_per_proposal",
+}
 OPERATION_STRING_LIST_FIELDS = {
     "labels", "preferred_sources", "include_globs", "exclude_globs",
-    "sensitive_patterns",
+    "sensitive_patterns", "readable_source_root_ids", "preferred_pipeline_names",
+    "protected_pipeline_ids", "protected_task_ids",
 }
 
 
@@ -76,10 +82,11 @@ class Operation(APIModel):
     data: dict[str, Any] = Field(default_factory=dict)
     atomic_group_id: UUID | None = None
     prerequisite_operation_ids: list[UUID] = Field(default_factory=list)
-    rationale: str = ""
+    rationale: str = Field(default="", max_length=4096)
     confidence: float | None = Field(default=None, ge=0, le=1)
-    evidence: list[dict[str, Any] | str] = Field(default_factory=list)
-    source_references: list[dict[str, Any]] = Field(default_factory=list)
+    basis: Literal["source_evidence", "user_instruction", "inference"] | None = None
+    evidence: list[dict[str, Any] | str] = Field(default_factory=list, max_length=8)
+    source_references: list[dict[str, Any]] = Field(default_factory=list, max_length=8)
 
     @field_validator("data")
     @classmethod
@@ -177,14 +184,76 @@ class LayoutMutationEnvelope(VersionedAPIModel):
     operations: list[Operation] = Field(min_length=1)
 
 
+class ScanSummary(APIModel):
+    files_considered: int = Field(default=0, ge=0)
+    files_read: int = Field(default=0, ge=0)
+    text_bytes_read: int = Field(default=0, ge=0)
+    truncated: bool = False
+    limitations: list[str] = Field(default_factory=list, max_length=20)
+
+    @field_validator("limitations", mode="before")
+    @classmethod
+    def accept_legacy_limitation_string(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return [value] if value else []
+        return value
+
+    @field_validator("limitations")
+    @classmethod
+    def validate_limitations(cls, value: list[str]) -> list[str]:
+        if any(not item or len(item) > 500 for item in value):
+            raise ValueError(
+                "scan-summary limitations must be nonempty and at most 500 characters"
+            )
+        return value
+
+
 class ProposalEnvelope(VersionedAPIModel):
     request_id: UUID = Field(default_factory=uuid4)
     project_id: UUID | None = None
     base_semantic_revision: int = Field(ge=0)
+    proposal_contract_version: Literal["1", "2"] = "1"
+    intent_id: UUID | None = None
+    result_kind: Literal["changes", "no_changes"] = "changes"
+    no_change_reason: Literal["up_to_date", "insufficient_evidence", "ambiguous_sources"] | None = None
     summary: str = Field(min_length=1, max_length=800)
-    rationale: str = ""
+    rationale: str = Field(default="", max_length=8192)
     actor_label: str = "Codex"
-    operations: list[Operation] = Field(min_length=1)
+    scan_summary: ScanSummary = Field(default_factory=ScanSummary)
+    evidence: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
+    source_references: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
+    operations: list[Operation] = Field(default_factory=list, max_length=200)
+
+    @model_validator(mode="after")
+    def validate_result_shape(self) -> "ProposalEnvelope":
+        if self.proposal_contract_version == "1":
+            if self.intent_id is not None:
+                raise ValueError("v1 proposals cannot carry an intent_id")
+            if self.result_kind != "changes" or self.no_change_reason is not None:
+                raise ValueError("v1 proposals support change results only")
+            if not self.operations:
+                raise ValueError("v1 proposals require at least one operation")
+            return self
+        if self.intent_id is None:
+            raise ValueError("v2 proposals require intent_id")
+        missing_wire_fields = {"result_kind", "scan_summary"} - self.model_fields_set
+        if missing_wire_fields:
+            raise ValueError(
+                f"v2 proposals require explicit {', '.join(sorted(missing_wire_fields))}"
+            )
+        if self.result_kind == "changes":
+            if not self.operations:
+                raise ValueError("change results require at least one operation")
+            if self.no_change_reason is not None:
+                raise ValueError("change results cannot carry no_change_reason")
+        else:
+            if self.operations:
+                raise ValueError("no-change results cannot contain operations")
+            if self.no_change_reason is None:
+                raise ValueError("no-change results require no_change_reason")
+            if not self.evidence and not self.source_references:
+                raise ValueError("no-change results require evidence or source references")
+        return self
 
 
 class ProposalApply(APIModel):
@@ -210,6 +279,62 @@ class ProposalRevision(VersionedAPIModel):
     rationale: str = ""
     operations: list[Operation] = Field(min_length=1)
 
+
+
+class ExplicitArtifactLocator(APIModel):
+    kind: Literal["local", "url"]
+    locator: str = Field(min_length=1, max_length=4096)
+    artifact_root_id: UUID | None = None
+    provider: str = Field(default="", max_length=120)
+    label: str = Field(default="", max_length=500)
+
+    @model_validator(mode="after")
+    def validate_locator_root(self) -> "ExplicitArtifactLocator":
+        if self.kind == "local" and self.artifact_root_id is None:
+            raise ValueError("local artifact locators require artifact_root_id")
+        if self.kind == "url" and self.artifact_root_id is not None:
+            raise ValueError("URL artifact locators cannot carry artifact_root_id")
+        return self
+
+
+class AgentPromptCreate(VersionedAPIModel):
+    mode: Literal[
+        "initialize_structure", "expand_task", "reconcile_progress",
+        "suggest_next_work", "record_update", "link_artifacts",
+    ]
+    scope_type: Literal["project", "pipeline", "task"]
+    scope_id: UUID | None = None
+    instructions: str = Field(default="", max_length=8192)
+    force_fresh: bool = False
+    allow_completion: bool = False
+    artifact_locators: list[ExplicitArtifactLocator] = Field(default_factory=list, max_length=50)
+    regenerate_proposal_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def validate_scope_and_mode(self) -> "AgentPromptCreate":
+        if self.scope_type == "project" and self.scope_id is not None:
+            raise ValueError("project scope cannot carry scope_id")
+        if self.scope_type != "project" and self.scope_id is None:
+            raise ValueError("pipeline and task scopes require scope_id")
+        allowed_scopes = {
+            "initialize_structure": {"project"},
+            "expand_task": {"task"},
+            "reconcile_progress": {"project", "pipeline", "task"},
+            "suggest_next_work": {"project", "pipeline"},
+            "record_update": {"task"},
+            "link_artifacts": {"task"},
+        }
+        if self.scope_type not in allowed_scopes[self.mode]:
+            raise ValueError(f"{self.mode} does not support {self.scope_type} scope")
+        if len(self.instructions.encode("utf-8")) > 8192:
+            raise ValueError("instructions must not exceed 8 KiB encoded as UTF-8")
+        if self.mode == "record_update" and not self.instructions.strip():
+            raise ValueError("record_update requires instructions")
+        if self.mode == "link_artifacts" and not self.artifact_locators:
+            raise ValueError("link_artifacts requires at least one artifact locator")
+        if self.allow_completion and self.mode != "record_update":
+            raise ValueError("allow_completion is valid only for record_update")
+        return self
 
 class BackupRestore(APIModel):
     path: str

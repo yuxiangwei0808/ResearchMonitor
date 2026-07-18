@@ -18,7 +18,7 @@ def test_completion_provenance_is_transition_aware(
     client: TestClient, project_root: Path
 ) -> None:
     project = enroll(client, project_root)
-    pipeline_id, task_id = str(uuid4()), str(uuid4())
+    pipeline_id, task_id, artifact_id = str(uuid4()), str(uuid4()), str(uuid4())
     created = mutate(
         client,
         project,
@@ -29,6 +29,12 @@ def test_completion_provenance_is_transition_aware(
                 "id": task_id,
                 "pipeline_id": pipeline_id,
                 "title": "Run planned comparison",
+            }),
+            op("artifact.create", {
+                "id": artifact_id,
+                "kind": "url",
+                "locator": "https://example.test/results/final.json",
+                "label": "Final result",
             }),
         ],
     )
@@ -65,7 +71,7 @@ def test_completion_provenance_is_transition_aware(
                 "evidence": [{
                     "kind": "result_evidence",
                     "summary": "The final result records every planned metric.",
-                    "locator": "results/final.json",
+                    "artifact_id": artifact_id,
                 }],
             }],
         },

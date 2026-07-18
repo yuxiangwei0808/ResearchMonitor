@@ -1,8 +1,17 @@
+import { readFileSync } from 'node:fs'
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 
+const versionSource = readFileSync(
+  new URL('../src/research_monitor/_version.py', import.meta.url),
+  'utf8',
+)
+const version = versionSource.match(/^VERSION = "([^"]+)"$/m)?.[1]
+if (!version) throw new Error('Unable to read Research Monitor release version')
+
 export default defineConfig({
+  define: { __RESEARCH_MONITOR_VERSION__: JSON.stringify(version) },
   plugins: [react(), tailwindcss()],
   build: {
     outDir: 'dist',

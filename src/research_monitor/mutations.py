@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl
 from uuid import UUID, uuid4
 
 from sqlalchemy import func, select
@@ -15,7 +17,7 @@ from .graph import GraphCycleError, descendants, validate_dag
 from .models import (
     GraphViewport,
     Artifact, ArtifactRoot, AuditEvent, IdempotencyRecord, JournalEntry, OutboxEvent,
-    Pipeline, Project, ScanPolicy, SourceReference, Task, TaskArtifact, TaskEdge,
+    Pipeline, PlanningProfile, Project, ScanPolicy, SourceReference, Task, TaskArtifact, TaskEdge,
     TaskLayout, utcnow,
 )
 from .schemas import LayoutMutationEnvelope, MutationEnvelope, MutationUndo, Operation
@@ -27,13 +29,15 @@ from .service import (
     ARTIFACT_ROLES, EDGE_TYPES, FLOW_MODES, JOURNAL_TYPES, TASK_KINDS, TASK_OUTCOMES,
     TASK_PRIORITIES, TASK_STATUSES, DomainError, ResearchMonitorService,
     _artifact_path, _public_artifact, _public_artifact_root, _public_edge,
-    _public_pipeline, _public_project, _public_scan_policy, _public_task,
+    _public_pipeline, _public_planning_profile, _public_project, _public_scan_policy, _public_task,
     _uuid, _validate_monitor_storage_separation, _validated_directory,
 )
+from .url_safety import parse_http_url
 
 
 SEMANTIC_OPERATION_TYPES = {
     "project.update", "project.archive", "project.trash", "project.restore", "project.relink",
+    "planning_profile.update",
     "scan_policy.update", "pipeline.create", "pipeline.update", "pipeline.archive",
     "pipeline.delete", "pipeline.restore", "task.create", "task.update", "task.move",
     "task.delete", "task.restore", "edge.create", "edge.update", "edge.delete",
@@ -45,6 +49,7 @@ LAYOUT_OPERATION_TYPES = {"layout.upsert", "layout.delete", "viewport.upsert"}
 OPERATION_UNIQUE_CONSTRAINT_TABLES = {
     "pipelines", "tasks", "task_edges", "journal_entries", "artifact_roots",
     "artifacts", "task_artifacts", "task_layouts", "graph_viewports", "proposal_operations",
+    "planning_profiles",
 }
 
 
@@ -144,13 +149,24 @@ class MutationService(ResearchMonitorService):
                     raise
                 raise translated from exc
         self._validate_project(session, project.id)
-        project.semantic_revision += 1
-        project.entity_version += 1
-        project.updated_at = utcnow()
-        if envelope.actor_type == "ui":
-            project.last_manual_update_at = utcnow()
+        semantic_changed = any(
+            bool(result.get("changed", True)) for result in results
+        )
+        if semantic_changed:
+            project.semantic_revision += 1
+            project.entity_version += 1
+            project.updated_at = utcnow()
+            if envelope.actor_type == "ui":
+                project.last_manual_update_at = utcnow()
         session.flush()
-        response = {"request_id": request_id, "project_id": project.id, "semantic_revision": project.semantic_revision, "layout_revision": project.layout_revision, "results": results}
+        response = {
+            "request_id": request_id,
+            "project_id": project.id,
+            "semantic_revision": project.semantic_revision,
+            "layout_revision": project.layout_revision,
+            "semantic_changed": semantic_changed,
+            "results": results,
+        }
         response.update(response_extra or {})
         session.add(IdempotencyRecord(request_id=request_id, project_id=project.id, action=idempotency_action, response_json=pack_idempotent_response(response, request_identity)))
         session.flush()
@@ -295,6 +311,7 @@ class MutationService(ResearchMonitorService):
     ) -> Any:
         models: dict[str, type] = {
             "project": Project,
+            "planning_profile": PlanningProfile,
             "scan_policy": ScanPolicy,
             "pipeline": Pipeline,
             "task": Task,
@@ -307,7 +324,7 @@ class MutationService(ResearchMonitorService):
         model = models.get(event.entity_type)
         if model is None:
             raise self._undo_error(f"{event.action} has no safe v1 inverse")
-        lookup_id = project.id if event.entity_type == "scan_policy" else event.entity_id
+        lookup_id = project.id if event.entity_type in {"scan_policy", "planning_profile"} else event.entity_id
         current = session.get(model, lookup_id)
         changed_later = any(
             row.entity_type == event.entity_type and row.entity_id == event.entity_id
@@ -352,9 +369,23 @@ class MutationService(ResearchMonitorService):
             keys = (
                 "preferred_sources", "include_globs", "exclude_globs", "sensitive_patterns",
                 "max_text_file_size", "git_history_limit", "allow_git_metadata",
-                "allow_outside_sources",
+                "readable_source_root_ids", "max_files_per_scan", "max_total_text_bytes",
             )
             return Operation(type=action, entity_id=entity_id, expected_version=expected_version, data={key: before.get(key) for key in keys})
+        if action == "planning_profile.update":
+            keys = (
+                "task_granularity", "max_nesting_depth", "planning_horizon",
+                "inference_policy", "max_new_tasks_per_proposal",
+                "preferred_pipeline_names", "terminology_notes",
+                "additional_instructions", "protected_pipeline_ids",
+                "protected_task_ids",
+            )
+            return Operation(
+                type=action,
+                entity_id=entity_id,
+                expected_version=expected_version,
+                data={key: before.get(key) for key in keys},
+            )
         if action == "pipeline.update":
             keys = ("title", "description", "flow_mode", "position")
             return Operation(type=action, entity_id=entity_id, expected_version=expected_version, data={key: before.get(key) for key in keys})
@@ -538,6 +569,81 @@ class MutationService(ResearchMonitorService):
         entity = session.get(model, str(raw_id))
         if entity is None or getattr(entity, "project_id", project.id) != project.id:
             raise DomainError(404, "entity_not_found", f"Entity for {operation.type} was not found")
+        deleted_at = getattr(entity, "deleted_at", None)
+        restore_types = {"pipeline.restore", "task.restore"}
+        if deleted_at is not None and operation.type not in restore_types:
+            raise DomainError(
+                409,
+                "entity_deleted",
+                f"{operation.type} targets a deleted entity",
+                {"entity_id": str(raw_id), "operation_type": operation.type},
+            )
+        if isinstance(entity, Pipeline):
+            if (
+                entity.archived_at is not None
+                and operation.type != "pipeline.restore"
+            ):
+                raise DomainError(
+                    409,
+                    "entity_inactive",
+                    f"{operation.type} targets an archived pipeline",
+                    {"entity_id": entity.id, "operation_type": operation.type},
+                )
+        elif isinstance(entity, Task):
+            pipeline = session.get(Pipeline, entity.pipeline_id)
+            if (
+                pipeline is None
+                or pipeline.deleted_at is not None
+                or pipeline.archived_at is not None
+            ):
+                raise DomainError(
+                    409,
+                    "entity_inactive",
+                    f"{operation.type} targets a task in an inactive pipeline",
+                    {"entity_id": entity.id, "operation_type": operation.type},
+                )
+        elif isinstance(entity, JournalEntry):
+            task = session.get(Task, entity.task_id)
+            pipeline = session.get(Pipeline, task.pipeline_id) if task is not None else None
+            if (
+                task is None
+                or task.deleted_at is not None
+                or pipeline is None
+                or pipeline.deleted_at is not None
+                or pipeline.archived_at is not None
+            ):
+                raise DomainError(
+                    409,
+                    "entity_inactive",
+                    f"{operation.type} targets a journal on an inactive task",
+                    {"entity_id": entity.id, "operation_type": operation.type},
+                )
+        elif isinstance(entity, TaskEdge):
+            endpoints = session.scalars(
+                select(Task).where(Task.id.in_([entity.source_id, entity.target_id]))
+            ).all()
+            endpoint_pipeline_ids = {item.pipeline_id for item in endpoints}
+            active_endpoint_pipeline_ids = set(
+                session.scalars(
+                    select(Pipeline.id).where(
+                        Pipeline.id.in_(endpoint_pipeline_ids),
+                        Pipeline.project_id == project.id,
+                        Pipeline.deleted_at.is_(None),
+                        Pipeline.archived_at.is_(None),
+                    )
+                ).all()
+            )
+            if (
+                len(endpoints) != 2
+                or any(item.deleted_at is not None for item in endpoints)
+                or active_endpoint_pipeline_ids != endpoint_pipeline_ids
+            ):
+                raise DomainError(
+                    409,
+                    "entity_inactive",
+                    f"{operation.type} targets an edge with an inactive endpoint",
+                    {"entity_id": entity.id, "operation_type": operation.type},
+                )
         current = getattr(entity, "entity_version", None)
         if operation.expected_version is not None and current != operation.expected_version:
             raise DomainError(409, "entity_version_conflict", f"{operation.type} targets a stale entity", {"entity_id": str(raw_id), "expected": operation.expected_version, "current": current})
@@ -553,6 +659,7 @@ class MutationService(ResearchMonitorService):
         data = dict(operation.data)
         kind = operation.type
         before: Any = None
+        changed = True
         entity_type = kind.split(".", 1)[0]
 
         if kind.startswith("project."):
@@ -562,9 +669,23 @@ class MutationService(ResearchMonitorService):
                 raise DomainError(409, "entity_version_conflict", "Project metadata is stale")
             before = _public_project(project)
             if kind == "project.update":
-                for key in ("name", "description", "research_goal", "success_criteria", "color"):
+                for key in ("name", "description", "research_goal", "success_criteria"):
                     if key in data:
-                        setattr(project, key, str(data[key]))
+                        value = str(data[key]).strip()
+                        if key == "name" and not value:
+                            raise DomainError(
+                                422, "missing_project_name", "Project name is required"
+                            )
+                        setattr(project, key, value)
+                if "color" in data:
+                    color = str(data["color"]).strip().lower()
+                    if re.fullmatch(r"#[0-9a-f]{6}", color) is None:
+                        raise DomainError(
+                            422,
+                            "invalid_project_color",
+                            "Project color must be a six-digit hexadecimal color",
+                        )
+                    project.color = color
             elif kind == "project.archive":
                 project.archived_at = utcnow()
             elif kind == "project.trash":
@@ -585,8 +706,25 @@ class MutationService(ResearchMonitorService):
                     root.root_path = str(new_root); root.entity_version += 1
                 relink_warnings = self._revalidate_local_artifacts(session, project)
             after = _public_project(project)
+            if kind == "project.update":
+                changed = before != after
             if relink_warnings:
                 after["artifact_warnings"] = relink_warnings
+        elif kind == "planning_profile.update":
+            if actor_type == "agent":
+                raise DomainError(
+                    403, "agent_authority", "Agents cannot alter planning profiles"
+                )
+            entity = session.get(PlanningProfile, project.id)
+            assert entity is not None
+            if operation.expected_version is not None and entity.entity_version != operation.expected_version:
+                raise DomainError(409, "entity_version_conflict", "Planning profile is stale")
+            before = _public_planning_profile(entity)
+            self._update_planning_profile(session, project, entity, data)
+            changed = before != _public_planning_profile(entity)
+            if changed:
+                entity.entity_version += 1
+            after = _public_planning_profile(entity)
         elif kind == "scan_policy.update":
             if actor_type == "agent":
                 raise DomainError(403, "agent_authority", "Agents cannot alter scan policy")
@@ -595,14 +733,35 @@ class MutationService(ResearchMonitorService):
             if operation.expected_version is not None and entity.entity_version != operation.expected_version:
                 raise DomainError(409, "entity_version_conflict", "Scan policy is stale")
             before = _public_scan_policy(entity)
-            for public, column in {"preferred_sources": "preferred_sources_json", "include_globs": "include_globs_json", "exclude_globs": "exclude_globs_json", "sensitive_patterns": "sensitive_patterns_json"}.items():
+            for public, column in {
+                "preferred_sources": "preferred_sources_json",
+                "include_globs": "include_globs_json",
+                "exclude_globs": "exclude_globs_json",
+                "sensitive_patterns": "sensitive_patterns_json",
+                "readable_source_root_ids": "readable_source_root_ids_json",
+            }.items():
                 if public in data:
-                    values = self._validated_string_list(public, data[public])
+                    values = self._validated_string_list(
+                        public,
+                        data[public],
+                        deduplicate=True,
+                        case_insensitive=(public == "sensitive_patterns"),
+                    )
                     if public == "preferred_sources":
                         for value in values:
                             path = Path(value)
                             if path.is_absolute() or ".." in path.parts:
                                 raise DomainError(422, "unsafe_preferred_source", "Preferred sources must be project-relative")
+                    if public == "readable_source_root_ids":
+                        normalized_roots: list[str] = []
+                        for raw_id in values:
+                            root_id = _uuid(raw_id)
+                            root = session.get(ArtifactRoot, root_id)
+                            if root is None or root.project_id != project.id or root.is_project_root:
+                                raise DomainError(422, "invalid_readable_source_root", "Readable source roots must be approved additional roots")
+                            if root_id not in normalized_roots:
+                                normalized_roots.append(root_id)
+                        values = normalized_roots
                     setattr(entity, column, canonical_json(values))
             if "max_text_file_size" in data:
                 value = data["max_text_file_size"]
@@ -618,10 +777,25 @@ class MutationService(ResearchMonitorService):
                 if not isinstance(data["allow_git_metadata"], bool):
                     raise DomainError(422, "invalid_scan_policy", "allow_git_metadata must be a boolean")
                 entity.allow_git_metadata = data["allow_git_metadata"]
-            if data.get("allow_outside_sources"):
-                raise DomainError(422, "outside_sources_unsupported", "Outside source roots are disabled in v1")
-            entity.allow_outside_sources = False
-            entity.follow_symlinks = False; entity.entity_version += 1
+            if "max_files_per_scan" in data:
+                value = data["max_files_per_scan"]
+                if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 5_000:
+                    raise DomainError(422, "invalid_scan_limit", "Maximum files per scan must be between 1 and 5,000")
+                entity.max_files_per_scan = value
+            if "max_total_text_bytes" in data:
+                value = data["max_total_text_bytes"]
+                if isinstance(value, bool) or not isinstance(value, int) or not 1024 <= value <= 100 * 1024 * 1024:
+                    raise DomainError(422, "invalid_scan_limit", "Maximum total text bytes must be between 1 KiB and 100 MiB")
+                entity.max_total_text_bytes = value
+            readable = json.loads(entity.readable_source_root_ids_json or "[]")
+            requested_legacy = data.get("allow_outside_sources")
+            if requested_legacy is not None and bool(requested_legacy) != bool(readable):
+                raise DomainError(422, "derived_scan_policy_field", "allow_outside_sources is derived from readable_source_root_ids")
+            entity.allow_outside_sources = bool(readable)
+            entity.follow_symlinks = False
+            changed = before != _public_scan_policy(entity)
+            if changed:
+                entity.entity_version += 1
             after = _public_scan_policy(entity)
         elif kind == "pipeline.create":
             flow = str(data.get("flow_mode", "sequential"))
@@ -667,7 +841,12 @@ class MutationService(ResearchMonitorService):
         elif kind == "task.create":
             pipeline_id = _uuid(data.get("pipeline_id"))
             pipeline = session.get(Pipeline, pipeline_id)
-            if pipeline is None or pipeline.project_id != project.id or pipeline.deleted_at is not None:
+            if (
+                pipeline is None
+                or pipeline.project_id != project.id
+                or pipeline.deleted_at is not None
+                or pipeline.archived_at is not None
+            ):
                 raise DomainError(422, "invalid_pipeline", "Task pipeline is unavailable")
             parent_id = str(data["parent_id"]) if data.get("parent_id") else None
             if parent_id:
@@ -762,9 +941,27 @@ class MutationService(ResearchMonitorService):
             task_id = _uuid(data.get("task_id")); self._require_tasks(session, project, [task_id])
             entry_type = str(data.get("entry_type", "note"))
             if entry_type not in JOURNAL_TYPES: raise DomainError(422, "invalid_journal_type", "Invalid journal entry type")
-            entity = JournalEntry(id=_uuid(data.get("id") or operation.entity_id), project_id=project.id, task_id=task_id, entry_type=entry_type, content=str(data.get("content") or ""), occurred_at=self._parse_datetime(data.get("occurred_at")) or utcnow())
+            content = str(data.get("content") or "")
+            entity = JournalEntry(
+                id=_uuid(data.get("id") or operation.entity_id),
+                project_id=project.id,
+                task_id=task_id,
+                entry_type=entry_type,
+                content=content,
+                origin_key=str(data.get("_origin_key") or "") or None,
+                content_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                occurred_at=self._parse_datetime(data.get("occurred_at")) or utcnow(),
+            )
             if not entity.content.strip(): raise DomainError(422, "empty_journal", "Journal content cannot be empty")
-            session.add(entity); session.flush(); after = self._public_journal(entity)
+            session.add(entity)
+            try:
+                session.flush()
+            except IntegrityError as exc:
+                message = str(getattr(exc, "orig", exc))
+                if entity.origin_key and "journal_entries" in message:
+                    raise DomainError(409, "journal_origin_duplicate", "A journal with this automation origin already exists") from exc
+                raise
+            after = self._public_journal(entity)
         elif kind in {"journal.update", "journal.delete"}:
             entity = self._entity(session, JournalEntry, project, operation); before = self._public_journal(entity)
             if kind == "journal.delete": entity.deleted_at = utcnow()
@@ -773,6 +970,7 @@ class MutationService(ResearchMonitorService):
                 if "entry_type" in data: entity.entry_type = str(data["entry_type"])
                 if entity.entry_type not in JOURNAL_TYPES or not entity.content.strip(): raise DomainError(422, "invalid_journal", "Journal type and content are required")
                 if "occurred_at" in data: entity.occurred_at = self._parse_datetime(data["occurred_at"]) or entity.occurred_at
+                entity.content_sha256 = hashlib.sha256(entity.content.encode("utf-8")).hexdigest()
             entity.entity_version += 1; after = self._public_journal(entity)
         elif kind == "artifact_root.create":
             if actor_type == "agent": raise DomainError(403, "agent_authority", "Agents cannot approve artifact roots")
@@ -784,6 +982,27 @@ class MutationService(ResearchMonitorService):
             if actor_type == "agent": raise DomainError(403, "agent_authority", "Agents cannot remove artifact roots")
             entity = self._entity(session, ArtifactRoot, project, operation); before = _public_artifact_root(entity)
             if entity.is_project_root: raise DomainError(409, "project_root_required", "Project artifact root cannot be deleted")
+            policy = session.get(ScanPolicy, project.id)
+            readable_root_ids = set(
+                json.loads(policy.readable_source_root_ids_json or "[]")
+                if policy is not None
+                else []
+            )
+            if entity.id in readable_root_ids:
+                raise DomainError(
+                    409,
+                    "artifact_root_readable",
+                    "Remove this root from the scan policy before deleting it",
+                )
+            if session.scalar(
+                select(func.count()).select_from(SourceReference).where(
+                    SourceReference.project_id == project.id,
+                    SourceReference.source_root_id == entity.id,
+                )
+            ):
+                raise DomainError(
+                    409, "artifact_root_cited", "A cited artifact root cannot be removed"
+                )
             if session.scalar(select(func.count()).select_from(Artifact).where(Artifact.root_id == entity.id)):
                 raise DomainError(
                     409, "artifact_root_history_retained",
@@ -802,20 +1021,14 @@ class MutationService(ResearchMonitorService):
             statement = statement.where(Artifact.root_id == root_id) if root_id else statement.where(Artifact.root_id.is_(None))
             tombstone = session.scalar(statement)
             if tombstone is not None:
-                entity = tombstone
-                before = _public_artifact(session, entity)
-                entity.deleted_at = None
-                entity.locator_type = locator_type
-                entity.provider = str(data.get("provider") or ("local" if locator_type == "local" else "external"))
-                entity.label = str(data.get("label") or "") or Path(locator).name
-                entity.notes = str(data.get("notes") or "")
-                entity.validation_warning = ""
-                entity.entity_version += 1
-                if requested_id != entity.id:
-                    entity_aliases[requested_id] = entity.id
-            else:
-                entity = Artifact(id=requested_id, project_id=project.id, root_id=root_id, locator_type=locator_type, locator=locator, provider=str(data.get("provider") or ("local" if locator_type == "local" else "external")), label=str(data.get("label") or "") or Path(locator).name, notes=str(data.get("notes") or ""), validation_warning="")
-                session.add(entity)
+                raise DomainError(
+                    409,
+                    "entity_deleted",
+                    "Artifact locator belongs to a deleted artifact",
+                    {"entity_id": tombstone.id, "field": "locator"},
+                )
+            entity = Artifact(id=requested_id, project_id=project.id, root_id=root_id, locator_type=locator_type, locator=locator, provider=str(data.get("provider") or ("local" if locator_type == "local" else "external")), label=str(data.get("label") or "") or Path(locator).name, notes=str(data.get("notes") or ""), validation_warning="")
+            session.add(entity)
             session.flush(); after = _public_artifact(session, entity)
         elif kind in {"artifact.update", "artifact.delete"}:
             entity = self._entity(session, Artifact, project, operation); before = _public_artifact(session, entity)
@@ -843,12 +1056,19 @@ class MutationService(ResearchMonitorService):
 
         session.flush()
         entity_id = str(getattr(entity, "id", project.id))
-        self._audit(
-            session, project, actor_type, actor_label, kind, entity_type,
-            entity_id, before, after, request_id,
-            result_revision=project.semantic_revision + 1,
-        )
-        return {"operation_id": str(operation.id), "type": kind, "entity_id": entity_id, "value": after}
+        if changed:
+            self._audit(
+                session, project, actor_type, actor_label, kind, entity_type,
+                entity_id, before, after, request_id,
+                result_revision=project.semantic_revision + 1,
+            )
+        return {
+            "operation_id": str(operation.id),
+            "type": kind,
+            "entity_id": entity_id,
+            "value": after,
+            "changed": changed,
+        }
 
     def _update_task(self, session: Session, project: Project, task: Task, data: dict[str, Any], actor_type: str, actor_label: str) -> None:
         previous_status = task.status
@@ -856,10 +1076,23 @@ class MutationService(ResearchMonitorService):
         new_parent_id = str(data["parent_id"]) if data.get("parent_id") else None
         if "parent_id" not in data: new_parent_id = task.parent_id
         pipeline = session.get(Pipeline, new_pipeline_id)
-        if pipeline is None or pipeline.project_id != project.id or pipeline.deleted_at is not None: raise DomainError(422, "invalid_pipeline", "Target pipeline is unavailable")
+        if (
+            pipeline is None
+            or pipeline.project_id != project.id
+            or pipeline.deleted_at is not None
+            or pipeline.archived_at is not None
+        ):
+            raise DomainError(422, "invalid_pipeline", "Target pipeline is unavailable")
         if new_parent_id:
             parent = session.get(Task, new_parent_id)
             if parent is None or parent.project_id != project.id or parent.deleted_at is not None: raise DomainError(422, "invalid_parent", "Target parent is unavailable")
+            parent_pipeline = session.get(Pipeline, parent.pipeline_id)
+            if (
+                parent_pipeline is None
+                or parent_pipeline.deleted_at is not None
+                or parent_pipeline.archived_at is not None
+            ):
+                raise DomainError(409, "entity_inactive", "Target parent is in an inactive pipeline")
             all_tasks = session.scalars(select(Task).where(Task.project_id == project.id)).all()
             if parent.id == task.id or parent.id in descendants(all_tasks).get(task.id, set()): raise DomainError(422, "hierarchy_cycle", "Cannot move a task under its descendant")
             new_pipeline_id = parent.pipeline_id
@@ -993,8 +1226,26 @@ class MutationService(ResearchMonitorService):
 
     @staticmethod
     def _require_tasks(session: Session, project: Project, task_ids: list[str]) -> None:
-        found = session.scalars(select(Task).where(Task.id.in_(task_ids), Task.project_id == project.id, Task.deleted_at.is_(None))).all()
-        if {task.id for task in found} != set(task_ids): raise DomainError(422, "invalid_task", "One or more task references are unavailable")
+        found = session.scalars(
+            select(Task).where(Task.id.in_(task_ids), Task.project_id == project.id)
+        ).all()
+        if {task.id for task in found} != set(task_ids):
+            raise DomainError(422, "invalid_task", "One or more task references are unavailable")
+        if any(task.deleted_at is not None for task in found):
+            raise DomainError(409, "entity_deleted", "One or more task references are deleted")
+        pipeline_ids = {task.pipeline_id for task in found}
+        active_pipeline_ids = set(
+            session.scalars(
+                select(Pipeline.id).where(
+                    Pipeline.id.in_(pipeline_ids),
+                    Pipeline.project_id == project.id,
+                    Pipeline.deleted_at.is_(None),
+                    Pipeline.archived_at.is_(None),
+                )
+            ).all()
+        )
+        if active_pipeline_ids != pipeline_ids:
+            raise DomainError(409, "entity_inactive", "One or more task references are in an inactive pipeline")
 
     def _validate_project(self, session: Session, project_id: str) -> None:
         pipelines = session.scalars(select(Pipeline).where(Pipeline.project_id == project_id)).all(); tasks = session.scalars(select(Task).where(Task.project_id == project_id)).all(); edges = session.scalars(select(TaskEdge).where(TaskEdge.project_id == project_id)).all(); active = {task.id: task for task in tasks if task.deleted_at is None}
@@ -1010,8 +1261,27 @@ class MutationService(ResearchMonitorService):
 
     def _validate_artifact_locator(self, session: Session, project: Project, kind: str, locator: str, root_id: str | None, *, exclude_id: str | None = None) -> None:
         if kind == "url":
-            parsed = urlparse(locator)
-            if parsed.scheme not in {"http", "https"} or not parsed.netloc: raise DomainError(422, "unsafe_url", "External artifacts require HTTP or HTTPS")
+            try:
+                parsed = parse_http_url(locator)
+            except ValueError as exc:
+                raise DomainError(422, "unsafe_url", "External artifacts require HTTP or HTTPS") from exc
+            if parsed.username is not None or parsed.password is not None:
+                raise DomainError(422, "artifact_url_credentials", "Artifact URLs cannot contain credentials")
+            for key, _value in parse_qsl(parsed.query, keep_blank_values=True):
+                folded = re.sub(r"[^a-z0-9]+", "_", key.casefold()).strip("_")
+                tokens = {token for token in folded.split("_") if token}
+                if (
+                    any(
+                        value in folded
+                        for value in (
+                            "access_token", "api_key", "secret", "password",
+                            "credential",
+                        )
+                    )
+                    or tokens
+                    & {"auth", "authorization", "bearer", "key", "sig", "signature", "token"}
+                ):
+                    raise DomainError(422, "artifact_url_secret", "Artifact URL contains a suspicious credential parameter")
             if root_id: raise DomainError(422, "url_with_root", "URL artifacts cannot have an artifact root")
             self._ensure_unique_artifact_locator(session, project, kind, locator, None, exclude_id)
             return
@@ -1076,13 +1346,101 @@ class MutationService(ResearchMonitorService):
         try: return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         except ValueError as exc: raise DomainError(422, "invalid_datetime", f"Invalid timestamp: {value}") from exc
 
+    def _update_planning_profile(
+        self,
+        session: Session,
+        project: Project,
+        entity: PlanningProfile,
+        data: dict[str, Any],
+    ) -> None:
+        enums = {
+            "task_granularity": {"coarse", "balanced", "detailed"},
+            "planning_horizon": {"immediate", "current_milestone", "whole_project"},
+            "inference_policy": {"sources_only", "cautious_gaps", "broad_roadmap"},
+        }
+        for field, allowed in enums.items():
+            if field in data:
+                value = str(data[field])
+                if value not in allowed:
+                    raise DomainError(422, "invalid_planning_profile", f"Invalid {field}")
+                setattr(entity, field, value)
+        for field, lower, upper in (
+            ("max_nesting_depth", 1, 6),
+            ("max_new_tasks_per_proposal", 1, 100),
+        ):
+            if field in data:
+                value = data[field]
+                if isinstance(value, bool) or not isinstance(value, int) or not lower <= value <= upper:
+                    raise DomainError(
+                        422, "invalid_planning_profile",
+                        f"{field} must be between {lower} and {upper}",
+                    )
+                setattr(entity, field, value)
+        if "preferred_pipeline_names" in data:
+            values = self._validated_string_list(
+                "preferred_pipeline_names",
+                data["preferred_pipeline_names"],
+                deduplicate=True,
+                case_insensitive=True,
+            )
+            if len(values) > 20:
+                raise DomainError(
+                    422, "invalid_planning_profile",
+                    "Preferred pipeline names must contain at most 20 values",
+                )
+            entity.preferred_pipeline_names_json = canonical_json(values)
+        for field, maximum in (
+            ("terminology_notes", 4096),
+            ("additional_instructions", 8192),
+        ):
+            if field in data:
+                value = str(data[field])
+                if len(value.encode("utf-8")) > maximum:
+                    raise DomainError(422, "invalid_planning_profile", f"{field} exceeds its UTF-8 byte limit")
+                setattr(entity, field, value)
+        for field, column, model in (
+            ("protected_pipeline_ids", "protected_pipeline_ids_json", Pipeline),
+            ("protected_task_ids", "protected_task_ids_json", Task),
+        ):
+            if field not in data:
+                continue
+            values = self._validated_string_list(field, data[field])
+            normalized = [_uuid(value) for value in values]
+            if len(normalized) > 500 or len(normalized) != len(set(normalized)):
+                raise DomainError(422, "invalid_planning_profile", f"{field} must contain at most 500 unique IDs")
+            for value in normalized:
+                target = session.get(model, value)
+                if target is None or target.project_id != project.id:
+                    raise DomainError(422, "invalid_protected_entity", f"{field} contains an entity outside this project")
+            setattr(entity, column, canonical_json(normalized))
+
     @staticmethod
-    def _validated_string_list(field: str, value: Any) -> list[str]:
-        if not isinstance(value, list) or len(value) > 1_000 or any(not isinstance(item, str) for item in value):
+    def _validated_string_list(
+        field: str,
+        value: Any,
+        *,
+        deduplicate: bool = False,
+        case_insensitive: bool = False,
+    ) -> list[str]:
+        if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
             raise DomainError(422, "invalid_scan_policy", f"{field} must be a list of strings")
         result = [item.strip() for item in value]
         if any(not item or len(item) > 500 or "\x00" in item for item in result):
             raise DomainError(422, "invalid_scan_policy", f"{field} contains an invalid pattern")
+        if deduplicate:
+            unique: list[str] = []
+            seen: set[str] = set()
+            for item in result:
+                identity = item.casefold() if case_insensitive else item
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                unique.append(item)
+            result = unique
+        if len(result) > 1_000:
+            raise DomainError(
+                422, "invalid_scan_policy", f"{field} contains too many values"
+            )
         return result
 
     def _apply_layout_operation(self, session: Session, project: Project, operation: Operation) -> dict[str, Any]:

@@ -1,10 +1,11 @@
 import { lazy, Suspense, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { NavLink, Navigate, useNavigate, useParams } from 'react-router-dom'
-import { AlertTriangle, Check, ChevronDown, Clipboard, ExternalLink, FolderOpen, MoreHorizontal } from 'lucide-react'
+import { AlertTriangle, ChevronDown, FolderOpen, MoreHorizontal, Sparkles } from 'lucide-react'
 import { api } from '../lib/api'
 import { shortPath } from '../lib/format'
 import { Badge, Button, ErrorState, Spinner, ViewErrorBoundary } from '../components/ui'
+import { AskCodexDialog, type GuidedRequestSeed } from '../components/AskCodexDialog'
 
 const OverviewView = lazy(async () => ({ default: (await import('./OverviewView')).OverviewView }))
 const OutlineView = lazy(async () => ({ default: (await import('./OutlineView')).OutlineView }))
@@ -25,19 +26,20 @@ const views = [
 ] as const
 
 export const snapshotSections: Record<(typeof views)[number][0], string[]> = {
-  overview: ['progress', 'pipelines', 'tasks'],
-  outline: ['pipelines', 'tasks', 'journals', 'artifact_roots', 'artifacts', 'task_artifacts'],
-  graph: ['pipelines', 'tasks', 'edges', 'layouts', 'viewports'],
-  artifacts: ['artifact_roots', 'pipelines', 'tasks', 'artifacts', 'task_artifacts'],
-  activity: ['project'],
-  proposals: ['pipelines', 'tasks', 'edges', 'journals', 'artifacts', 'task_artifacts'],
-  settings: ['scan_policy', 'artifact_roots'],
+  overview: ['progress', 'pipelines', 'tasks', 'scan_policy', 'artifact_roots', 'planning_profile'],
+  outline: ['pipelines', 'tasks', 'journals', 'artifact_roots', 'artifacts', 'task_artifacts', 'scan_policy', 'planning_profile'],
+  graph: ['pipelines', 'tasks', 'edges', 'layouts', 'viewports', 'scan_policy', 'artifact_roots', 'planning_profile'],
+  artifacts: ['artifact_roots', 'pipelines', 'tasks', 'artifacts', 'task_artifacts', 'scan_policy', 'planning_profile'],
+  activity: ['project', 'pipelines', 'tasks', 'scan_policy', 'artifact_roots', 'planning_profile'],
+  proposals: ['pipelines', 'tasks', 'edges', 'journals', 'artifacts', 'task_artifacts', 'scan_policy', 'artifact_roots', 'planning_profile'],
+  settings: ['scan_policy', 'artifact_roots', 'pipelines', 'tasks', 'planning_profile', 'automation_state'],
 }
 
 export function ProjectWorkspace() {
   const { projectId, view } = useParams()
   const navigate = useNavigate()
-  const [copied, setCopied] = useState(false)
+  const [askOpen, setAskOpen] = useState(false)
+  const [askSeed, setAskSeed] = useState<GuidedRequestSeed>({})
   const requestedView = views.some(([slug]) => slug === view) ? view as keyof typeof snapshotSections : 'overview'
   const sections = snapshotSections[requestedView]
   const snapshotQuery = useQuery({
@@ -45,17 +47,15 @@ export function ProjectWorkspace() {
     queryFn: () => api.getSnapshot(projectId!, sections),
     enabled: Boolean(projectId),
   })
-  const projectsQuery = useQuery({ queryKey: ['projects'], queryFn: () => api.listProjects(true) })
+  const projectsQuery = useQuery({ queryKey: ['projects'], queryFn: () => api.listProjects(true, true) })
   if (!view) return <Navigate to={`/projects/${projectId}/overview`} replace />
   if (snapshotQuery.isLoading) return <div className="content-loading"><Spinner label="Loading project monitor…" /></div>
   if (snapshotQuery.error || !snapshotQuery.data) return <div className="page"><ErrorState error={snapshotQuery.error ?? new Error('Project was not found.')} retry={() => snapshotQuery.refetch()} /></div>
   const snapshot = snapshotQuery.data
   const project = snapshot.project
-  const copyPrompt = async () => {
-    const text = `Use $research-monitor for project ${project.id} at ${project.root_path}. Inspect this enrolled project read-only and propose updates to its pipelines, tasks, progress, and artifact links. Submit a reviewable proposal; do not apply it.`
-    await navigator.clipboard.writeText(text)
-    setCopied(true)
-    window.setTimeout(() => setCopied(false), 1800)
+  const openAskCodex = (seed: GuidedRequestSeed = {}) => {
+    setAskSeed(seed)
+    setAskOpen(true)
   }
   const activeProjects = (projectsQuery.data ?? []).filter((item) => !item.archived && !item.trashed)
   return (
@@ -85,7 +85,7 @@ export function ProjectWorkspace() {
           <p title={project.root_path}><FolderOpen size={14} />{shortPath(project.root_path, 78)}</p>
         </div>
         <div className="project-heading-actions">
-          <Button variant="secondary" onClick={copyPrompt}>{copied ? <Check size={16} /> : <Clipboard size={16} />}{copied ? 'Copied' : 'Copy Codex prompt'}</Button>
+          <Button variant="secondary" onClick={() => openAskCodex()}><Sparkles size={16} />Ask Codex</Button>
           <Button variant="ghost" size="icon" aria-label="More project actions" onClick={() => navigate(`/projects/${project.id}/settings`)}><ChevronDown size={18} /></Button>
         </div>
       </header>
@@ -95,23 +95,27 @@ export function ProjectWorkspace() {
       <div className="project-content">
         <ViewErrorBoundary resetKey={`${project.id}:${view}`}>
         <Suspense fallback={<div className="content-loading"><Spinner label="Opening project view…" /></div>}>
-        {view === 'overview' && <OverviewView snapshot={snapshot} copyPrompt={copyPrompt} />}
-        {view === 'outline' && <OutlineView snapshot={snapshot} />}
-        {view === 'graph' && <GraphView snapshot={snapshot} />}
+        {view === 'overview' && <OverviewView snapshot={snapshot} copyPrompt={() => openAskCodex({ mode: 'initialize_structure', scopeType: 'project' })} />}
+        {view === 'outline' && <OutlineView snapshot={snapshot} onAskCodex={openAskCodex} />}
+        {view === 'graph' && <GraphView snapshot={snapshot} onAskCodex={openAskCodex} />}
         {view === 'artifacts' && <ArtifactsView snapshot={snapshot} />}
         {view === 'activity' && <ActivityView snapshot={snapshot} />}
-        {view === 'proposals' && <ProposalsView snapshot={snapshot} />}
+        {view === 'proposals' && <ProposalsView snapshot={snapshot} onAskCodex={openAskCodex} />}
         {view === 'settings' && <SettingsView snapshot={snapshot} />}
         {!views.some(([slug]) => slug === view) && <Navigate to={`/projects/${project.id}/overview`} replace />}
         </Suspense>
         </ViewErrorBoundary>
       </div>
+      <AskCodexDialog open={askOpen} onClose={() => setAskOpen(false)} snapshot={snapshot} seed={askSeed} />
     </div>
   )
 }
 
 function ProposalCount({ projectId }: { projectId: string }) {
-  const query = useQuery({ queryKey: ['proposals', projectId], queryFn: () => api.getProposals(projectId) })
-  const count = query.data?.filter((proposal) => proposal.status === 'draft').length ?? 0
+  const query = useQuery({
+    queryKey: ['proposals', projectId, 'summary-count', 'open'],
+    queryFn: () => api.getProposalPage(projectId, { status: 'open', limit: 1, summary: true }),
+  })
+  const count = query.data?.total ?? query.data?.draft_count ?? 0
   return count ? <span className="tab-count">{count}</span> : null
 }

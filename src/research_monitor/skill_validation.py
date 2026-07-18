@@ -8,7 +8,12 @@ import re
 from pathlib import Path
 
 try:
-    from .contracts import render_cli_reference_block, render_operation_reference_block
+    from .contracts import (
+        render_cli_reference_block,
+        render_evidence_reference_block,
+        render_guided_proposal_reference_block,
+        render_operation_reference_block,
+    )
 except ImportError:  # setuptools may load the cmdclass module outside its package.
     _contracts_spec = importlib.util.spec_from_file_location(
         "_research_monitor_build_contracts", Path(__file__).with_name("contracts.py")
@@ -18,6 +23,10 @@ except ImportError:  # setuptools may load the cmdclass module outside its packa
     _contracts = importlib.util.module_from_spec(_contracts_spec)
     _contracts_spec.loader.exec_module(_contracts)
     render_cli_reference_block = _contracts.render_cli_reference_block
+    render_evidence_reference_block = _contracts.render_evidence_reference_block
+    render_guided_proposal_reference_block = (
+        _contracts.render_guided_proposal_reference_block
+    )
     render_operation_reference_block = _contracts.render_operation_reference_block
 
 
@@ -188,5 +197,17 @@ def validate_skill_tree(path: Path) -> None:
         changes_text,
         "agent-operation-schemas",
         render_operation_reference_block(),
+        "references/change-set-schema.md",
+    )
+    _validate_generated_block(
+        changes_text,
+        "guided-proposal-contract",
+        render_guided_proposal_reference_block(),
+        "references/change-set-schema.md",
+    )
+    _validate_generated_block(
+        changes_text,
+        "guided-evidence-fields",
+        render_evidence_reference_block(),
         "references/change-set-schema.md",
     )

@@ -5,6 +5,7 @@ const port = 8876
 const runId = randomUUID()
 const testHome = `/tmp/research-monitor-playwright-${runId}`
 const fixtureRoot = `/tmp/research-monitor-playwright-fixtures-${runId}`
+const codexHome = `/tmp/research-monitor-playwright-codex-${runId}`
 
 export default defineConfig({
   testDir: './e2e',
@@ -17,7 +18,7 @@ export default defineConfig({
   workers: 1,
   retries: process.env.CI ? 1 : 0,
   reporter: 'line',
-  metadata: { testHome, fixtureRoot },
+  metadata: { testHome, fixtureRoot, codexHome },
   outputDir: `/tmp/research-monitor-playwright-output-${runId}`,
   use: {
     baseURL: `http://127.0.0.1:${port}`,
@@ -35,6 +36,7 @@ export default defineConfig({
       ...process.env,
       RESEARCH_MONITOR_HOME: testHome,
       RESEARCH_MONITOR_ALLOWED_ROOTS: '/tmp',
+      CODEX_HOME: codexHome,
     },
   },
 })

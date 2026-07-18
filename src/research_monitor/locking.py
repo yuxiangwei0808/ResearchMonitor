@@ -15,6 +15,7 @@ from .config import process_start_ticks
 _MAX_OWNER_BYTES = 4096
 _MAX_HOSTNAME_LENGTH = 255
 _MAX_TIMESTAMP_LENGTH = 64
+_MAX_PURPOSE_LENGTH = 64
 
 
 def _bounded_owner_metadata(handle: TextIO) -> dict[str, Any]:
@@ -47,10 +48,13 @@ def _bounded_owner_metadata(handle: TextIO) -> dict[str, Any]:
     acquired_at = value.get("acquired_at_utc")
     if isinstance(acquired_at, str) and 0 < len(acquired_at) <= _MAX_TIMESTAMP_LENGTH:
         owner["acquired_at_utc"] = acquired_at
+    purpose = value.get("purpose")
+    if isinstance(purpose, str) and 0 < len(purpose) <= _MAX_PURPOSE_LENGTH:
+        owner["purpose"] = purpose
     return owner
 
 
-def _current_owner_metadata() -> dict[str, Any]:
+def _current_owner_metadata(purpose: str | None = None) -> dict[str, Any]:
     hostname = socket.gethostname().strip()[:_MAX_HOSTNAME_LENGTH] or "unknown"
     owner: dict[str, Any] = {
         "hostname": hostname,
@@ -60,14 +64,17 @@ def _current_owner_metadata() -> dict[str, Any]:
     start_ticks = process_start_ticks(os.getpid())
     if start_ticks is not None:
         owner["process_start_ticks"] = start_ticks
+    if purpose is not None:
+        owner["purpose"] = purpose[:_MAX_PURPOSE_LENGTH]
     return owner
 
 
 class ApplicationLock:
     """Owner-only advisory lock with bounded cross-host diagnostic metadata."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, purpose: str | None = None):
         self.path = Path(path)
+        self.purpose = purpose
         self.handle: TextIO | None = None
         self.owner_metadata: dict[str, Any] = {}
 
@@ -91,7 +98,7 @@ class ApplicationLock:
             handle.close()
             return False
 
-        owner = _current_owner_metadata()
+        owner = _current_owner_metadata(self.purpose)
         try:
             handle.seek(0)
             handle.truncate()

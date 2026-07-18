@@ -1,6 +1,6 @@
 # Research Monitor agent CLI contract
 
-Use this reference for command spelling, transport behavior, and error handling. Use the `proposal_contract` in live agent context for the exact operation/data schema supported by the installed application.
+Use this reference for command spelling, transport behavior, and error handling. Use `proposal_contract` in live agent context for the exact intent, evidence, result, operation, and data schemas supported by the installed application.
 
 ## Common response envelope
 
@@ -27,7 +27,7 @@ Failures use the same version and request fields plus:
 }
 ```
 
-Do not scrape human-formatted output. Reject an envelope with an unsupported API or schema version.
+Do not scrape human-formatted output. Reject unsupported API/schema versions or missing capabilities. Guided v2 prompts require version capabilities named by the prompt, including `guided_agent_intents`, `proposal_contract`, `scoped_agent_context`, and `no_change_results`.
 
 ## Commands
 
@@ -38,47 +38,61 @@ research-monitor open [--no-open] [--json]
 research-monitor project list --json
 research-monitor project resolve --path PATH --json
 research-monitor agent context --project UUID --json
+research-monitor agent context --project UUID --intent UUID --json
 research-monitor proposal validate --project UUID --file FILE_OR_-
 research-monitor proposal create --project UUID --file FILE_OR_-
 research-monitor proposal inspect PROPOSAL_ID --json
 research-monitor export project --project UUID [--output PATH]
 research-monitor backup create [--output PATH] [--force]
-research-monitor backup restore PATH --confirm
+research-monitor backup restore PATH --confirm [--rollback-to-v0.1]
 research-monitor skill status
 research-monitor skill install [--force]
 research-monitor skill update [--force]
 ```
 <!-- END GENERATED: stable-cli-commands -->
 
-For skill-driven maintenance, use only `version`, `project resolve`, `agent context`, `proposal validate`, `proposal create`, and `proposal inspect`. The dashboard open, export, backup, restore, and skill-management commands are documented for users but are outside the reconciliation workflow.
+The generated block is authoritative for exact installed spelling. The guided context form is:
 
-Pass `-` to proposal `--file` to read exactly one UTF-8 JSON object from standard input. Validation does not persist a proposal. Creation persists a draft for human review; it does not apply operations.
+```text
+research-monitor agent context --project UUID --intent UUID --json
+```
 
-## Agent context
+For guided maintenance, use only `version`, intent-bound `agent context`, `proposal validate`, `proposal create`, and `proposal inspect`. Use `project resolve` and unqualified context only for warned legacy reconciliation. Dashboard, export, backup, restore, and skill-management commands are user operations outside the agent workflow.
 
-Successful `agent context` data contains:
+Pass `-` to proposal `--file` to read exactly one UTF-8 JSON object from standard input. Validation does not persist a result. Creation persists either a reviewable changes draft or a closed no-change check; it never applies operations.
+
+## Intent-bound context
+
+The browser issues an immutable, expiring intent and places its project and intent UUIDs in the copied prompt. Do not mint an intent, call browser endpoints, or replace prompt claims with agent-selected values.
+
+Successful intent-bound context includes:
 
 ```text
 project                 identity, canonical root, availability, semantic_revision
-scan_policy             preferred sources, globs, limits, Git policy, sensitive paths
-artifact_roots          roots already approved by a human
-pipelines               canonical pipeline snapshot and entity versions
-tasks                   canonical task snapshot and entity versions
-edges                   dependency/related edges and waivers
-artifacts               existing artifact locators and task associations
-source_references       prior identities, anchors, and fingerprints
-proposal_contract       supported operation types and their data requirements
+intent                  UUID, bound request UUID, mode, scope, expiry, completion permission
+planning_profile        granularity, horizon, inference and enforced structural limits
+scan_policy             readable roots, globs, file/byte limits, Git policy, sensitive paths
+scope                    writable entities with full versions plus read-only boundary stubs
+readiness                values computed from the complete active project graph
+identity_indexes         compact accepted sources, artifacts, journal hashes, open drafts
+proposal_contract       v2 result, evidence, mode, scope, and operation schemas
 ```
 
-Journal bodies are excluded by default. Do not infer that an absent body or source was deleted. Request only capabilities exposed by the CLI; do not read the database.
+Compact collections report `items`, `total`, `limit`, and `truncated` in deterministic order. Journal bodies, artifact previews, secret locators, and unrelated task descriptions are excluded. Never infer absent content was deleted. If a required identity index is truncated, omit uncertain creates or ask the user to narrow the dashboard scope.
+Intent `explicit_artifact_locators` and the project artifact identity index expose deterministic `locator_hash` values. Compare them to reuse an existing artifact UUID. Each explicit item also has `redacted`, safe `display_locator`, and `locator`: the exact locator when unredacted, or an intent-bound `intent-locator:<locator_hash>` token when redacted. Copy that token only to `artifact.create.data.locator` for the same intent; never send the display value, bare hash, or reconstructed secret. The server resolves and revalidates the exact locator before accepting the operation.
 
-## Project resolution
 
-Resolution takes an absolute or relative path, canonicalizes it safely, and selects the deepest enrolled project root containing it. Treat not-found, unavailable, and ambiguous responses as terminal until a human resolves them in the UI. Never enroll or relink from the skill.
+The intent is bound to its issued semantic revision and planning-profile version. A layout-only change does not stale it. Stop on `intent_stale`, `intent_expired`, `intent_consumed`, project mismatch, or scope ineligibility and ask for a fresh dashboard prompt.
+
+## Legacy project resolution
+
+Legacy resolution takes an absolute or relative path, canonicalizes it safely, and selects the deepest enrolled project root containing it. Treat not-found, unavailable, and ambiguous responses as terminal until a human resolves them in the UI. Never enroll or relink from the skill.
+
+Unqualified `agent context --project UUID --json` preserves the v1 compatibility path. Warn that it lacks intent provenance and typed-mode enforcement. Never present a legacy proposal as guided v2 work.
 
 ## Git metadata safety
 
-Inspect Git metadata only when the returned scan policy explicitly permits it. Substitute the canonical project root, a numeric history limit no larger than the policy limit, and exact policy-authorized pathspecs in these command shapes:
+Inspect Git metadata only when the returned scan policy explicitly permits it. Substitute the canonical project root, a numeric history limit no larger than policy, and exact authorized pathspecs in these command shapes:
 
 ```text
 git --no-optional-locks --no-pager -c core.fsmonitor=false -c core.hooksPath=/dev/null -C ROOT status --short --untracked-files=no --ignore-submodules=all
@@ -88,23 +102,23 @@ git --no-optional-locks --no-pager -c core.fsmonitor=false -c core.hooksPath=/de
 git --no-optional-locks --no-pager -c core.fsmonitor=false -c core.hooksPath=/dev/null -C ROOT ls-files --stage -- PATHSPEC
 ```
 
-Pass substituted values as safely quoted arguments and impose the tool's time and output limits. The global `--no-optional-locks` flag is mandatory on every invocation because nominally read-only commands may otherwise refresh or lock the index. Disabling the pager, fsmonitor, hooks, external diffs, text conversion, and submodule traversal prevents repository configuration from turning inspection into project execution. Capture output directly from the tool; never use output files, shell redirection, or `tee` in or beneath an enrolled root.
+Pass substituted values as safely quoted arguments and impose tool time/output limits. The global `--no-optional-locks` flag is mandatory because nominally read-only commands may otherwise refresh or lock the index. Disabling pager, fsmonitor, hooks, external diffs, text conversion, and submodule traversal prevents repository configuration from turning inspection into execution. Capture output directly; never redirect it into an enrolled root.
 
-Do not run any other Git subcommand. In particular, never add, commit, switch, checkout, reset, clean, stash, fetch, pull, push, merge, rebase, update the index, run maintenance, or invoke a repository alias or hook. Never inspect `.git` files directly.
+Do not run any other Git subcommand. Never add, commit, switch, checkout, reset, clean, stash, fetch, pull, push, merge, rebase, update the index, run maintenance, invoke aliases or hooks, or inspect `.git` files directly.
 
-## Exit codes
+## Exit codes and guided failures
 
 | Code | Meaning | Required response |
 |---:|---|---|
 | 0 | Success | Continue after validating the envelope. |
-| 2 | Invalid input or schema | Correct the payload; do not bypass validation. |
-| 3 | Project not found or path ambiguous | Ask the user to select/enroll/relink in the UI. |
-| 4 | Semantic revision conflict | Fetch fresh context and regenerate affected operations. |
-| 5 | CLI/API/database incompatibility | Stop and report the installed versions. |
-| 6 | Server, lock, or transport unavailable | Retry the identical request once; retain its request UUID. |
+| 2 | Invalid input or schema | Correct truthful payload errors; never bypass validation. |
+| 3 | Project not found or path ambiguous | Ask the user to select, enroll, or relink in the UI. |
+| 4 | Semantic revision or intent conflict | Ask for a fresh dashboard intent; never replay stale operations. |
+| 5 | CLI/API/database incompatibility | Stop and report installed versions and capabilities. |
+| 6 | Server, lock, or transport unavailable | Retry one identical request; retain its bound request UUID. |
 
-Any other nonzero exit is terminal. Do not retry a changed payload with the old request UUID.
+Any other nonzero exit is terminal. Structured intent errors take precedence over generic retry advice. Never retry changed content with the bound request UUID.
 
 ## Coordination and safety
 
-The CLI uses the authenticated local API while the server owns the database lock and the shared domain service when it can safely acquire an offline lock. Do not manipulate runtime descriptors, locks, tokens, or SQLite files. Do not call HTTP endpoints directly. Never use export, backup, or restore as a substitute for a proposal.
+The CLI uses the authenticated local API while the server owns the database lock and the shared domain service when it can safely acquire an offline lock. Do not manipulate runtime descriptors, locks, tokens, SQLite files, or HTTP endpoints. Never use export, backup, or restore as a substitute for a proposal.

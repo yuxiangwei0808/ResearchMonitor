@@ -1,100 +1,213 @@
 # Research Monitor
 
-Research Monitor is a free, local-first dashboard for planning and recording work across research projects that you explicitly enroll. It combines editable pipelines, arbitrarily nested tasks, dependency graphs, journals, artifact links, audit history, and reviewable Codex proposals. It does not embed an LLM and never writes to enrolled research folders.
+Research Monitor is a free, local-first web app for planning and recording research work across the folders you explicitly choose to enroll. It gives each project editable pipelines, arbitrarily nested tasks, a focused dependency graph, journals, artifact links, audit history, and optional reviewable Codex proposals.
 
-## Install and run
+It is designed for one researcher on a Linux host (including a remote Linux machine used through VS Code). It needs no account, hosted database, Docker, or Node.js at runtime. It is a research-task monitor—not an experiment dashboard: W&B and MLflow can be linked as artifacts, but Research Monitor does not fetch or visualize their metrics.
 
-The release wheel contains the compiled web interface and companion skill. Routine use needs Python 3.12 and `uv`; Node.js is only needed to build the frontend from source.
+Research Monitor keeps its data in a central SQLite database. It never writes to, moves, executes, or otherwise changes an enrolled research folder.
+
+## Start here
+
+### What you need
+
+- A Linux host with Python 3.12 and [`uv`](https://docs.astral.sh/uv/).
+- A released `research_monitor-0.2.0-py3-none-any.whl` wheel. Get it from the project release artifacts or build it from source as described in [Development](#development).
+- A normal web browser. When using VS Code Remote from Windows, use VS Code's **Ports** panel to open the browser on your local machine.
+
+Check the two runtime prerequisites:
 
 ```bash
-uv tool install /path/to/research_monitor-0.1.0-py3-none-any.whl
-research-monitor serve --open
+python3 --version
+uv --version
 ```
 
-Stop a running monitor gracefully, or replace it in one command:
+Install the wheel, then confirm the command is available:
+
+```bash
+uv tool install /path/to/research_monitor-0.2.0-py3-none-any.whl
+research-monitor version --json
+```
+
+To upgrade an existing installation, stop the monitor first and add `--force`:
 
 ```bash
 research-monitor stop
-research-monitor serve --force-restart --open
+uv tool install --force /path/to/research_monitor-0.2.0-py3-none-any.whl
 ```
 
-`--force-restart` authenticates the recorded server instance, requests a graceful shutdown, waits for its host-local lock, and then reacquires the host-local and shared writer locks in order while starting the replacement. With no explicit `--port`, it reuses the running server's port. It never attempts to stop an instance on another host: if the shared writer lock is owned elsewhere, startup fails closed and reports bounded owner metadata. A server started by a release that predates these commands must be stopped once with `Ctrl+C` in its original terminal before upgrading.
+### Open the dashboard
 
-The server binds only to `127.0.0.1`. The default address is `http://127.0.0.1:8765`; set `RESEARCH_MONITOR_PORT` to choose another port.
-
-For VS Code Remote, start `research-monitor serve --port 8765`, forward
-remote port 8765 to local port 8765, and use VS Code's external **Open in
-Browser** action—not **Preview in Editor** or Simple Browser. A user-launched
-top-level visit to either `http://localhost:8765/` or
-`http://127.0.0.1:8765/` automatically establishes the protected browser
-session. Reopening the same address also works for a fresh browser profile or
-after its cookies are cleared. Port probes, embedded pages, cross-site
-navigation, assets, and API requests cannot create a session.
-
-Browser sessions last only for the browser session and the current server process. Reopen the bare dashboard address to establish a fresh one. As a compatibility or recovery fallback, mint a 60-second, one-use login URL with the owner-authenticated CLI:
+On a local Linux desktop, this is usually enough:
 
 ```bash
-research-monitor open
+research-monitor serve --open
 ```
 
-Use `research-monitor open --no-open` to print the URL without launching a browser.
+For a remote Linux host in VS Code, start a chosen remote port instead. `--open` may try to open a browser on the remote host, so it is not needed here:
 
-From the dashboard, add only the project folders you want to monitor. A newly enrolled project is intentionally empty: create a pipeline/task manually or copy its Codex initialization prompt.
+```bash
+research-monitor serve --port 8765
+```
 
-## Typical workflow
+Then:
 
-1. Enroll a project folder from the portfolio.
-2. Define pipelines and nested tasks in Outline, or ask Codex to draft a proposal.
-3. Reorder, move, edit, archive, delete, and restore work graphically.
-4. Connect dependencies and related work in Graph. A dependency may be waived only with a recorded reason.
-5. Record progress, decisions, blockers, outcomes, completion evidence, and artifact associations.
-6. Inspect every Codex operation in Proposals. Select or edit operations, then apply the dependency-closed selection atomically.
+1. Open VS Code's **Ports** panel and forward remote port `8765`.
+2. Select its **Open in Browser** action. Use the **Forwarded Address** that VS Code supplies; its local port can differ from `8765`.
+3. Open that address in a normal external browser tab, not **Simple Browser** or **Preview in Editor**.
 
-In Outline, click a task title to open the full editor. Use the visible `…` menu—or right-click/long-press the task row—for Edit, Add subtask, and Delete. Deletion is recoverable from Deleted items. Target date is editable; Created, Last updated, and Completed timestamps are recorded automatically.
+A user-initiated visit to the bare forwarded address automatically creates the protected browser session. If port `8765` is busy or times out, choose another unused remote port, for example `9013`, restart with `--port 9013`, and forward that same remote port.
 
-Graph opens on the first pipeline and displays only its top-level tasks. Select another pipeline or All pipelines. Hover over a parent task for a read-only preview of its immediate subtasks; keyboard focus opens the same preview, and Escape closes it. A single click only selects and highlights a task. Double-click a parent, press Enter or Space while it is focused, or click its **X subtasks** control to drill into the next hierarchy level. On a leaf, those navigation gestures do nothing beyond leaving it selected. Use the breadcrumb or **Up one level** to return. Editing is available only through the graph card's `…` menu or its right-click/long-press menu.
+If the browser still asks you to authenticate, first reopen the bare forwarded address in a normal browser. As a recovery fallback, run this on the Linux host:
 
-W&B and MLflow entries are stored as artifact links. Research Monitor does not fetch their data or replace experiment-monitoring tools.
+```bash
+research-monitor open --no-open
+```
 
-## Companion Codex skill
+It prints a one-use URL valid for 60 seconds. Treat that URL like a password and do not share it. When VS Code assigned a different local port, keep the printed `/__bootstrap/...` path but use the scheme, host, and port from VS Code's Forwarded Address.
 
-Install or inspect the bundled skill with:
+### Create your first project
+
+1. On the **Portfolio** page, select **Add project**.
+2. Enter a name and an absolute **Linux** folder path, such as `/home/me/research/my-study`. Do not enter a Windows path such as `C:\Users\you\research\my-study` when the monitor runs remotely.
+3. Select **Add project**. The project starts empty on purpose.
+4. Open **Outline**, choose **Create pipeline**, then choose **Create task**. Add subtasks as needed.
+
+You can also enroll an existing folder from the terminal:
+
+```bash
+research-monitor project add /home/me/research/my-study --name "My study"
+```
+
+An enrolled root must exist, be an absolute Linux directory, and be inside an allowed workspace root. By default, the allowed area is your home directory. Before starting the server, narrow or extend it with a colon-separated list if needed:
+
+```bash
+RESEARCH_MONITOR_ALLOWED_ROOTS=/home/me:/mnt/research research-monitor serve --port 8765
+```
+
+## Learn the model in two minutes
+
+| Term | Meaning |
+| --- | --- |
+| **Project** | One explicitly enrolled research folder. You can archive or remove its monitor data without changing that folder. |
+| **Pipeline** | A group of tasks. It is either **Sequential** (adjacent tasks imply order) or **Freeform** (no automatic order). |
+| **Task** | A piece of work, milestone, or gate. Tasks can be nested to any practical depth within their pipeline. |
+| **Dependency** | An explicit prerequisite that affects readiness. A **related** edge only records a connection and never blocks work. |
+| **Status** | Your workflow state: planned, in progress, blocked, review, done, or dropped. A blocked task needs an explanation. |
+| **Readiness** | A computed signal: ready, waiting, blocked, or inconsistent. It is not a status you edit. |
+| **Outcome** | The scientific result of completed work. A done experiment can still be negative, failed, or inconclusive. |
+| **Artifact** | A safe reference to code, a result file, a document, a run URL, or other evidence. The monitor does not fetch remote artifacts. |
+| **Proposal** | A reviewable set of suggested changes from Codex. Nothing is applied until you select and confirm it. |
+
+## Everyday use
+
+### Plan and edit work
+
+Start in **Outline** for most edits:
+
+- Create one or more pipelines, then add top-level tasks and subtasks.
+- Select a task title to open its full editor. Use the visible `…` menu—or right-click/long-press a task row—for Edit, Add subtask, and Delete.
+- Deletion is recoverable from **Deleted items**. Archive a project when you want to hide it without deleting its monitor history.
+- Record target dates, priorities, labels, completion criteria, blocker explanations, and journal entries as you go.
+- Mark a task done only when its completion criteria are met. The monitor records the time, actor, evidence, and optional scientific outcome.
+
+Use **Overview** for counts and recent recorded activity; use **Artifacts** to link local results, code, papers, W&B runs, MLflow runs, and dashboards; use **Activity** for the audit trail. “Recent activity” means recorded monitor activity—Research Monitor does not watch or infer filesystem changes.
+
+### Use the graph without losing the hierarchy
+
+**Graph** shows one hierarchy level at a time so a large plan stays readable.
+
+- Choose a pipeline or **All pipelines** to see top-level tasks.
+- Hover over, or keyboard-focus, a parent to preview its immediate subtasks. The preview is read-only.
+- A single click selects a card. Double-click a parent, press Enter or Space while it is focused, or select **X subtasks** to drill into its children.
+- Use breadcrumbs or **Up one level** to return. On a leaf task, navigation gestures only keep it selected.
+- Edit only through the graph card's `…` menu or its right-click/long-press menu. This prevents accidental edits while navigating.
+
+Dependencies, related edges, sequential order, and readiness remain synchronized between Outline and Graph. Collapsed parents indicate connections involving hidden descendants.
+
+## Optional Codex automation
+
+You do **not** need Codex, an OpenAI account, or the companion skill for manual planning, editing, journals, artifacts, graph work, backups, or recovery.
+
+If you do use it, review the project scan policy in **Settings** first. Copying an **Ask Codex** prompt sends nothing. Running that prompt in Codex can send the disclosed monitor context and only the project text permitted by that scan policy to Codex/OpenAI. Every result is a proposal for your review; the agent never applies changes itself.
+
+| Ask Codex mode | Use it when you want to… |
+| --- | --- |
+| **Initialize structure** | Draft the first pipelines and top-level planned tasks for an empty project. |
+| **Expand task** | Break one active task into planned descendants or clarify its planning fields. |
+| **Reconcile progress** | Compare allowed source evidence with existing tasks and propose recorded progress or evidence links. |
+| **Suggest next work** | Draft additional planned work for a project or pipeline without recording progress. |
+| **Record update** | Turn one explicit note about one task into a journal entry and optional progress update. |
+| **Link artifacts** | Link one or more explicitly supplied artifact locations to one task. |
+
+The dashboard creates a scoped, expiring intent for the selected mode. It binds the project, scope, semantic revision, planning profile, completion permission, and explicit artifact locators, so Codex cannot mint or broaden it. In **Proposals**, inspect the rationale, evidence, risks, and individual operations; then select the dependency-complete set you want and confirm the atomic application. A no-change result is also useful: it records that the allowed evidence was already up to date, insufficient, or ambiguous.
+
+### Install the optional companion skill
+
+The skill is bundled for convenience but is never installed by the browser or by a normal monitor install. Check its status at any time; this command is read-only:
 
 ```bash
 research-monitor skill status
-research-monitor skill install
-research-monitor skill update
 ```
 
-The skill resolves an enrolled project, reads its human-configured scan policy, inspects permitted text and bounded Git metadata read-only, and submits a structured proposal. It cannot enroll/relink projects, approve roots, change scan policy, execute project code, use the network, modify research files, or apply its own proposal.
-
-Stable agent commands include:
+To opt in, stop the monitor and install the skill in the same remote environment where you run Codex:
 
 ```bash
-research-monitor version --json
-research-monitor project resolve --path /absolute/project/path --json
-research-monitor agent context --project PROJECT_UUID --json
-research-monitor proposal validate --project PROJECT_UUID --file proposal.json
-research-monitor proposal create --project PROJECT_UUID --file proposal.json
-research-monitor proposal inspect PROPOSAL_UUID --json
+research-monitor stop
+research-monitor skill install
+research-monitor serve --port 8765
 ```
+
+Use `research-monitor skill update` only when a skill is already installed and you deliberately want to replace it. The dashboard reports **Current**, **Missing**, **Modified**, **Outdated**, or **Blocked** and shows the appropriate command. The installer refuses to use a `CODEX_HOME` that overlaps an enrolled project or approved artifact root, even with `--force`.
+
+The bundled skill is contractually instructed not to execute project code, modify research files, fetch the network, or read paths outside the approved scan policy. Research Monitor enforces what monitor data and proposal operations it accepts, but it cannot technically prevent a separate process already running as the same OS user from using unrelated filesystem or network tools. Treat the scan policy and the same-user threat boundary accordingly.
+
+The `agent context`, `proposal validate`, and `proposal create` commands are stable interfaces for Codex and other integrations. Ordinary users normally use the dashboard and the commands in this README instead.
+
+## Troubleshooting
+
+| What you see | What to do |
+| --- | --- |
+| `monitor already running` | Stop it with `research-monitor stop`, or intentionally replace it with `research-monitor serve --force-restart`. On a remote host, use `research-monitor open --no-open` to mint a recovery URL for the existing server; if you started it in the foreground, Ctrl+C is also valid. |
+| Forwarded page times out or stays blank | Check that the server is still running, choose a different unused **remote** port with `research-monitor serve --port PORT`, then forward that same port in VS Code. Do not use VS Code Simple Browser. |
+| “Unable to load this view” or authentication warning | Reopen the bare forwarded address in a normal browser tab. If that does not help, run `research-monitor open --no-open` and open its short-lived one-use URL. |
+| A folder cannot be enrolled | Use an existing absolute Linux path, not a Windows path. Check `RESEARCH_MONITOR_ALLOWED_ROOTS`, then restart the server after changing it. |
+| No project or task is shown | A new project is intentionally empty. Create a pipeline and task manually, or choose **Initialize structure** under Ask Codex after reviewing the scan policy. |
+| Optional skill is Missing, Modified, or Blocked | Manual monitoring still works. Run `research-monitor skill status` for the exact next step; do not install it into a research folder. |
 
 ## Backups and recovery
 
+Create a verified backup before a wheel upgrade, a migration, or any change you would be unhappy to lose:
+
 ```bash
 research-monitor backup create
+```
+
+The command prints the backup path and validates it with SQLite's integrity check. Keep that path somewhere safe. The monitor also makes a verified backup before migrations and permanent project purges.
+
+Restoring replaces monitor data, so stop the server and use an explicit confirmation only when you intend to recover:
+
+```bash
+research-monitor stop
 research-monitor backup restore /path/to/monitor-backup.db --confirm
 ```
 
-Backups use SQLite's online backup API and must pass `PRAGMA integrity_check`. Restore requires the server to be stopped, validates the candidate's schema and integrity before replacement, and normally creates a fresh verified pre-restore backup. If corruption makes that backup impossible, restore first preserves the exact SQLite main database plus any WAL, SHM, and rollback-journal sidecars in an owner-only `forensics/pre-restore-*` directory with a private manifest containing the reason, source path, timestamp, sizes, and SHA-256 hashes. The CLI reports either recovery location in its structured result. Permanently purging a trashed project also creates a verified backup first:
+Restore validates the candidate's integrity and schema before replacement and normally creates a fresh pre-restore backup. Archiving, trashing, purging, relinking, restoring monitor state, and backups never modify the research folder.
+
+### Rolling back a v0.2 database
+
+This is an advanced compatibility operation, not a normal restore. While v0.2 is still installed, restore a verified pre-0005 backup with the preserving flag, then reinstall v0.1 before restarting:
 
 ```bash
-research-monitor project purge PROJECT_UUID --confirm PROJECT_UUID
+research-monitor backup restore /path/to/pre-0005.db --confirm --rollback-to-v0.1
 ```
 
-Archiving, trashing, purging, relinking, and restoring monitor state never modify the research folder.
+Never start v0.1 against a v0.2 database, and do not restart v0.2 after this preserving restore.
 
-## Data and security
+## Advanced operation and security
+
+Most users can rely on the defaults. This section is for people changing storage locations, sharing a database between Linux hosts, or auditing the local security model.
+
+### Storage and local security
 
 Default Linux/XDG locations are:
 
@@ -103,26 +216,28 @@ Default Linux/XDG locations are:
 - Configuration: `$XDG_CONFIG_HOME/research-monitor/config.toml`
 - Host-local runtime descriptor, CLI token, and application lock: `$XDG_RUNTIME_DIR/research-monitor/`
 
-The monitor is a single-writer SQLite application. It uses rollback-journal `DELETE` mode with `synchronous=FULL`, which is more compatible with network filesystems than WAL/NORMAL because WAL shared-memory coordination is not used. These settings do not guarantee durability on every NFS client, server, or mount. Normal startup performs read-only integrity and schema checks before database access and refuses to write when either check fails, with an actionable structured recovery error. If startup finds a preserved hot rollback journal, it first retains an owner-only forensic copy, lets SQLite perform a controlled rollback, and then repeats integrity and foreign-key checks before proceeding.
+If an XDG variable is absent, Research Monitor uses an owner-only fallback below the user data directory. Set `RESEARCH_MONITOR_HOME=/path/to/isolated-home` for tests or a temporary monitor; that override deliberately keeps data and runtime state together.
 
-The server holds both the host-local application lock and database-adjacent shared writer lock for its lifetime. Offline commands acquire them in that order, including commands that only read monitor data. If the local lock is held, the CLI routes through the verified server on that host. If the local lock is free but the shared lock is held, it does not touch the database; it returns `shared_writer_active` with bounded hostname, PID, process-start tick, and acquisition-time metadata when available.
+The server binds only to `127.0.0.1`, accepts local hosts and origins, uses SameSite browser sessions and CSRF protection, and has no CORS or CDN dependency. It protects against malicious browser pages and untrusted project content, but not another process already running as the same OS user.
 
-For one database shared across Linux login hosts, keep `XDG_RUNTIME_DIR` host-local and place `XDG_DATA_HOME` on the shared filesystem. Only one host may serve or access the monitor offline at a time, and the NFS server and every client mount must honor cross-host advisory locks. Host-local `stop` and `--force-restart` commands do not seize or terminate a remote host's instance. This release was crash-, backup-, and restore-tested on an actual NFS filesystem from one host. Its cross-host exclusion test used distinct runtime directories on that host; a real two-host deployment is not certified. In particular, a mount reported as `soft,local_lock=none` requires operator verification of server-side lock behavior before sharing a monitor database across hosts. For important monitor state, prefer local storage or a hard-mounted NFS deployment whose advisory locking and crash durability have been verified, and retain verified backups.
+Local artifacts are stored as approved-root UUIDs plus relative paths. Every access repeats realpath and symlink-containment checks. Secret-like paths and unsafe formats are metadata-only; external artifacts accept only HTTP/HTTPS and are never fetched. Approving an artifact root does not allow Codex to read it: it must separately be selected as a readable source in the project scan policy.
 
-If an XDG variable is absent, Research Monitor uses an owner-only fallback beneath the user data directory. Set `RESEARCH_MONITOR_HOME=/path/to/isolated-home` for tests or temporary monitors; that override intentionally places data and runtime state together. Set `RESEARCH_MONITOR_ALLOWED_ROOTS` to a colon-separated allowlist when enrollment should be narrower than the home directory.
+### Shared storage and NFS
 
-Local artifacts are referenced by approved-root UUID plus relative path. Every access repeats realpath and symlink-containment checks. Secret-like paths and unsafe formats are metadata-only; external artifacts accept only HTTP/HTTPS and are never fetched.
+The monitor is a single-writer SQLite application. It uses rollback-journal `DELETE` mode with `synchronous=FULL`, which avoids WAL shared-memory coordination and is generally friendlier to network filesystems. It does not guarantee durability on every NFS server or mount.
 
-Project and additional artifact roots must remain separate from Research Monitor's data, configuration, runtime, database, and managed backup paths. The application rejects either direction of overlap so enrolling a broad parent folder cannot cause backups or runtime files to be written into research storage.
+For one database shared across Linux hosts, keep `XDG_RUNTIME_DIR` host-local and place `XDG_DATA_HOME` on the shared filesystem. Only one host may serve or access the monitor offline at a time, and every mount must honor cross-host advisory locks. Host-local `stop` and `--force-restart` never seize an instance on a different host.
 
-The localhost threat model protects against malicious browser pages and untrusted project content, but not another process already running as the same OS user.
+The release was crash-, backup-, and restore-tested on an actual NFS filesystem from one host. A true two-host deployment is not certified. Prefer local storage for important monitor state unless you have verified advisory locking and crash durability for your NFS deployment, and keep verified backups.
 
 ## Development
+
+This section is for contributors building from source. End users should install a released wheel as described in [Start here](#start-here).
 
 Requirements:
 
 - Python 3.12 and `uv`
-- Node.js 24 and npm for frontend work
+- Node.js 24 and npm for frontend work only
 
 Install and test the backend:
 
@@ -131,12 +246,6 @@ uv sync --extra dev
 uv run pytest tests/backend
 uv run pytest tests/skill
 ```
-
-The backend suite builds a wheel into a temporary directory, verifies that its
-Python modules, compiled frontend, and four-file companion skill exactly match
-the source trees, then installs it into an isolated environment. The smoke test
-runs the installed CLI, skill installer, browser bootstrap, packaged dashboard,
-API, and fresh SQLite database with Node absent from `PATH`.
 
 Run the backend and Vite development server in separate terminals:
 
@@ -164,18 +273,6 @@ uv run python /path/to/skill-creator/scripts/quick_validate.py skills/research-m
 uv build
 ```
 
-The Playwright suite rebuilds the Vite production assets, starts the real
-`research-monitor serve` FastAPI process with a unique temporary monitor home
-and SQLite database, opens the bare dashboard URL in multiple fresh browser
-contexts, and drives Chromium against that server. It enrolls temporary on-disk projects and
-uses the authenticated agent API only to submit proposal fixtures; UI reads and
-mutations still cross the real HTTP, CSRF, domain-service, and persistence
-boundary. It does not use the Vite development server, mocked requests, or an
-installed wheel.
+The backend suite verifies an isolated installed wheel with no Node runtime and no source-tree import bridge. It separately verifies the optional skill stays missing during the core smoke test and can be explicitly installed into an isolated `CODEX_HOME`. The Playwright suite drives the production FastAPI/Vite bundle through the real HTTP, CSRF, persistence, and browser-session boundaries.
 
-The wheel build fails when the compiled frontend or validated bundled skill is absent. No CDN or hosted service is used at runtime.
-It also fails for missing or stale frontend references, unexpected or missing
-skill files, malformed `SKILL.md` frontmatter or `agents/openai.yaml` metadata,
-and generated CLI/change-set reference blocks that differ from the backend
-contract definitions. Reused build directories are cleaned before verified
-asset copies, preventing obsolete hashed assets from leaking into a wheel.
+The full release process is in [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md). The project is licensed under the [MIT License](LICENSE).

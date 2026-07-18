@@ -9,7 +9,8 @@ from sqlalchemy import event, inspect, text
 
 import research_monitor.database as database_module
 from research_monitor.database import Database
-from research_monitor.models import Base, Project
+from research_monitor.migrations.schema_v0001 import V0001_METADATA
+from research_monitor.migrations.schema_v0002 import GRAPH_VIEWPORT_TABLE
 
 
 class InjectedMigrationFailure(RuntimeError):
@@ -53,7 +54,7 @@ def test_failed_revision_rolls_back_ddl_stamp_and_injected_writes_then_retries(
     database.initialize()
     with database.engine.connect() as connection:
         tables = set(inspect(connection).get_table_names())
-        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0004"
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0005"
     assert "graph_viewports" in tables
     assert "injected_uncommitted_write" not in tables
 
@@ -66,7 +67,7 @@ def test_failed_revision_rolls_back_ddl_stamp_and_injected_writes_then_retries(
     )
     with database.engine.connect() as connection:
         assert connection.scalar(text("SELECT count(*) FROM graph_viewports")) == 0
-        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0004"
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0005"
     database.engine.dispose()
 
 
@@ -77,13 +78,16 @@ def test_historically_partial_revision_resumes_without_recreating_existing_table
     alembic_command.upgrade(database._alembic_config(), "0001")
     project_id = str(uuid4())
     viewport_id = str(uuid4())
-    with database.Session.begin() as session:
-        session.add(
-            Project(
-                id=project_id,
-                name="Partial migration project",
-                root_path=str(tmp_path / "project"),
-            )
+    with database.engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO projects "
+                "(id,name,root_path,description,research_goal,success_criteria,color,"
+                "semantic_revision,layout_revision,entity_version,created_at,updated_at) "
+                "VALUES (:id,'Partial migration project',:root,'','','','#4f46e5',"
+                "0,0,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+            ),
+            {"id": project_id, "root": str(tmp_path / "project")},
         )
     # Simulate the old unsafe runner committing revision 0002's DDL before its
     # Alembic version stamp. The idempotent revision should adopt this table and
@@ -115,7 +119,7 @@ def test_historically_partial_revision_resumes_without_recreating_existing_table
 
     database.initialize()
     with database.engine.connect() as connection:
-        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0004"
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0005"
         viewport = connection.execute(
             text(
                 "SELECT id, project_id, scope_id, x, y, zoom, entity_version "
@@ -137,7 +141,7 @@ def test_historically_partial_revision_resumes_without_recreating_existing_table
     backups_after_recovery = sorted(
         (tmp_path / "backups").glob("pre-migration-*.db")
     )
-    assert len(backups_after_recovery) == 3
+    assert len(backups_after_recovery) == 4
     database.initialize()
     assert sorted((tmp_path / "backups").glob("pre-migration-*.db")) == (
         backups_after_recovery
@@ -155,7 +159,8 @@ def test_revision_0004_repairs_and_stamp_roll_back_together_then_retry(
     tmp_path: Path,
 ) -> None:
     database = Database(tmp_path / "0004-rollback.db")
-    Base.metadata.create_all(database.engine)
+    V0001_METADATA.create_all(database.engine)
+    GRAPH_VIEWPORT_TABLE.create(bind=database.engine)
     with database.engine.begin() as connection:
         connection.execute(text("DROP TABLE source_references"))
         connection.execute(text("DROP TABLE task_edges"))
@@ -248,6 +253,13 @@ def test_revision_0004_repairs_and_stamp_roll_back_together_then_retry(
         event.remove(database.engine, "before_cursor_execute", fail_at_0004_stamp)
 
     source_identity = ("project_id", "source_path", "anchor", "opaque_key")
+    source_identity_v2 = (
+        "project_id",
+        "source_root_id",
+        "source_path",
+        "anchor",
+        "opaque_key",
+    )
     with database.engine.connect() as connection:
         inspector = inspect(connection)
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0003"
@@ -271,7 +283,7 @@ def test_revision_0004_repairs_and_stamp_roll_back_together_then_retry(
     database.initialize()
     with database.engine.connect() as connection:
         inspector = inspect(connection)
-        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0004"
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0005"
         assert "opaque_key" in {
             column["name"] for column in inspector.get_columns("source_references")
         }
@@ -286,7 +298,7 @@ def test_revision_0004_repairs_and_stamp_roll_back_together_then_retry(
             for item in inspector.get_indexes("source_references")
             if item.get("unique")
         }
-        assert source_identity in unique_shapes
+        assert source_identity_v2 in unique_shapes
         assert connection.execute(text("PRAGMA foreign_key_check")).fetchall() == []
     assert database.integrity_check() == "ok"
     database.engine.dispose()

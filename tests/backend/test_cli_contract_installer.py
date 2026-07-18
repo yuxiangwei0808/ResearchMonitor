@@ -20,6 +20,7 @@ def _configure_monitor(tmp_path: Path, monkeypatch) -> tuple[Path, str]:
     project = tmp_path / "research"
     home.mkdir()
     project.mkdir()
+    (project / "PLAN.md").write_text("# Plan\n", encoding="utf-8")
     monkeypatch.setenv("RESEARCH_MONITOR_HOME", str(home))
     monkeypatch.setenv("RESEARCH_MONITOR_ALLOWED_ROOTS", str(tmp_path))
     reset_database_singleton()
@@ -92,6 +93,7 @@ def test_invalid_staged_skill_preserves_modified_install_and_force_backs_it_up(
     codex_home = tmp_path / "codex"
     source = REPOSITORY / "skills" / "research-monitor"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("RESEARCH_MONITOR_HOME", str(tmp_path / "installer-monitor-home"))
     monkeypatch.setenv("RESEARCH_MONITOR_SKILL_SOURCE", str(source))
 
     installed = runner.invoke(app, ["skill", "install"])

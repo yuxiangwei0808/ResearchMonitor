@@ -1,5 +1,5 @@
 import { ContextMenu, Menu } from '@base-ui/react'
-import { Edit3, ListTree, MoreHorizontal, Plus, Trash2 } from 'lucide-react'
+import { Edit3, ListTree, MoreHorizontal, Plus, Sparkles, Trash2 } from 'lucide-react'
 import { Fragment, type ReactElement, type ReactNode } from 'react'
 import { clsx } from 'clsx'
 import type { Task } from '../types'
@@ -10,6 +10,7 @@ export type TaskActionProps = {
   onAddSubtask: () => void
   onDelete: () => void
   onOpenSubtasks?: () => void
+  onAskCodex?: () => void
   childCount?: number
 }
 
@@ -20,11 +21,12 @@ type Action = {
   danger?: boolean
 }
 
-function actions({ onEdit, onAddSubtask, onDelete, onOpenSubtasks, childCount = 0 }: TaskActionProps): Action[] {
+function actions({ onEdit, onAddSubtask, onDelete, onOpenSubtasks, onAskCodex, childCount = 0 }: TaskActionProps): Action[] {
   const result: Action[] = [
     { label: 'Edit task', icon: <Edit3 size={14} />, run: onEdit },
     { label: 'Add subtask', icon: <Plus size={14} />, run: onAddSubtask },
   ]
+  if (onAskCodex) result.push({ label: 'Ask Codex about task', icon: <Sparkles size={14} />, run: onAskCodex })
   if (onOpenSubtasks && childCount > 0) {
     result.push({
       label: 'View ' + childCount + ' subtask' + (childCount === 1 ? '' : 's'),

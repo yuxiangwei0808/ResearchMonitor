@@ -22,13 +22,14 @@ import { formatCalendarDate, humanize, statusTone } from '../lib/format'
 import { createTaskLabeler, taskPickerSearchText } from '../lib/taskLabels'
 import { Badge, Button, Dialog, EmptyState, Field, Notice } from '../components/ui'
 import { TaskActionsButton, TaskContextRegion } from '../components/TaskActions'
+import type { GuidedRequestSeed } from '../components/AskCodexDialog'
 import { TaskEditor } from './OutlineView'
 
 const nodeColors: Record<string, string> = {
   planned: '#94a09a', in_progress: '#477bb5', blocked: '#b34d4d', review: '#bf7b28', done: '#4e825c', dropped: '#a4a7a0',
 }
 
-export function GraphView({ snapshot }: { snapshot: ProjectSnapshot }) {
+export function GraphView({ snapshot, onAskCodex }: { snapshot: ProjectSnapshot; onAskCodex?: (seed: GuidedRequestSeed) => void }) {
   const [scope, setScope] = useState<string | null>(null)
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
   const [edgeType, setEdgeType] = useState<'dependency' | 'related'>('dependency')
@@ -145,12 +146,13 @@ export function GraphView({ snapshot }: { snapshot: ProjectSnapshot }) {
           onEdit={() => editTask(task)}
           onAddSubtask={() => addSubtask(task)}
           onDelete={() => deleteTask(task)}
+          onAskCodex={onAskCodex ? () => onAskCodex({ mode: 'expand_task', scopeType: 'task', scopeId: task.id }) : undefined}
         />,
       },
       className: `research-node status-${task.status}${selectedTaskId === task.id ? ' is-selected' : ''}`,
       style: { borderColor: nodeColors[task.status] },
     }
-  }), [visibleTasks, snapshot.layouts, scope, selectedPipelineId, selectedTaskId, pipelineOrder, children, linkIndicators, editTask, addSubtask, deleteTask])
+  }), [visibleTasks, snapshot.layouts, scope, selectedPipelineId, selectedTaskId, pipelineOrder, children, linkIndicators, editTask, addSubtask, deleteTask, onAskCodex])
 
   const graphEdges = useMemo<Edge[]>(() => {
     const result = new Map<string, Edge>()
@@ -326,7 +328,7 @@ export function GraphView({ snapshot }: { snapshot: ProjectSnapshot }) {
   )
 }
 
-function GraphNode({ task, subtasks, childCounts, selected, nestedLinks, externalLinks, onSelect, onOpen, onEdit, onAddSubtask, onDelete }: {
+function GraphNode({ task, subtasks, childCounts, selected, nestedLinks, externalLinks, onSelect, onOpen, onEdit, onAddSubtask, onDelete, onAskCodex }: {
   task: Task
   subtasks: Task[]
   childCounts: Map<string | null, Task[]>
@@ -338,6 +340,7 @@ function GraphNode({ task, subtasks, childCounts, selected, nestedLinks, externa
   onEdit: () => void
   onAddSubtask: () => void
   onDelete: () => void
+  onAskCodex?: () => void
 }) {
   const childCount = subtasks.length
   const previewTasks = subtasks.slice(0, 6)
@@ -361,7 +364,7 @@ function GraphNode({ task, subtasks, childCounts, selected, nestedLinks, externa
   useEffect(() => () => {
     if (previewCloseTimer.current !== null) clearTimeout(previewCloseTimer.current)
   }, [])
-  const actionProps = { task, childCount, onEdit, onAddSubtask, onDelete, onOpenSubtasks: onOpen }
+  const actionProps = { task, childCount, onEdit, onAddSubtask, onDelete, onOpenSubtasks: onOpen, onAskCodex }
   const mainButton = (
     <button
       type="button"
@@ -373,7 +376,15 @@ function GraphNode({ task, subtasks, childCounts, selected, nestedLinks, externa
         cancelPreviewClose()
       }}
       onMouseLeave={() => { previewTriggerHovered.current = false }}
-      onClick={(event) => { event.stopPropagation(); onSelect() }}
+      onClick={(event) => {
+        event.stopPropagation()
+        // PreviewCard composes trigger handlers around this button. Browsers
+        // still emit a detail=0 click for keyboard activation even when the
+        // composed keydown handler consumes Enter/Space first, so keep the
+        // documented keyboard drill behavior reliable at that native seam.
+        if (childCount && event.detail === 0) onOpen()
+        else onSelect()
+      }}
       onDoubleClick={(event) => {
         event.stopPropagation()
         if (childCount) onOpen()

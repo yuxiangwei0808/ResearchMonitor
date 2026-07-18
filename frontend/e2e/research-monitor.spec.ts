@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
+import AxeBuilder from '@axe-core/playwright'
 import { request as playwrightRequest, type APIRequestContext, type Page, type TestInfo } from '@playwright/test'
 import { expect, metadata, test, type E2EMetadata } from './fixtures'
 
@@ -17,6 +18,13 @@ const projectIdFromUrl = (page: Page) => new URL(page.url()).pathname.split('/')
 async function openPortfolio(page: Page) {
   await page.goto('/')
   await expect(page.getByRole('heading', { name: 'Portfolio' })).toBeVisible()
+}
+
+async function expectNoA11yViolations(page: Page, surface: string) {
+  const result = await new AxeBuilder({ page })
+    .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22a', 'wcag22aa'])
+    .analyze()
+  expect(result.violations, `${surface} WCAG A/AA violations:\n${JSON.stringify(result.violations, null, 2)}`).toEqual([])
 }
 
 async function enroll(page: Page, name: string, root: string) {
@@ -65,6 +73,23 @@ async function createTask(page: Page, title: string, key: string, parentTitle?: 
   await dialog.getByRole('button', { name: 'Create task' }).click()
   await expect(dialog).toBeHidden()
   await expect(taskRow(page, title)).toBeVisible()
+}
+
+async function issueGuidedPrompt(page: Page, modeName: string) {
+  await page.getByRole('button', { name: 'Ask Codex', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: 'Ask Codex' })
+  await dialog.getByRole('radio', { name: new RegExp(modeName, 'i') }).check()
+  const scopeType = dialog.getByLabel('Scope type')
+  if (await scopeType.inputValue() !== 'project') await dialog.locator('select[required]').selectOption({ index: 1 })
+  if (modeName === 'Record an update') await dialog.getByLabel('Update to record').fill('Recorded from the compiled-browser guided workflow check.')
+  if (modeName === 'Link artifacts') {
+    await dialog.getByRole('button', { name: 'Add locator' }).click()
+    await dialog.getByRole('textbox', { name: 'Artifact locator', exact: true }).fill('results/browser-check.json')
+  }
+  await dialog.getByRole('button', { name: 'Generate prompt' }).click()
+  await expect(dialog.getByText('Bound request', { exact: true })).toBeVisible()
+  await dialog.getByRole('button', { name: 'Close', exact: true }).click()
+  await expect(dialog).toBeHidden()
 }
 
 function taskRow(page: Page, title: string) {
@@ -198,6 +223,7 @@ test.describe.serial('Research Monitor production browser journeys', () => {
   test('validates enrollment in the compiled dashboard', async ({ page }) => {
     await openPortfolio(page)
     await expect(page).toHaveTitle('Research Monitor')
+    await expectNoA11yViolations(page, 'Portfolio')
     await page.locator('.portfolio-heading').getByRole('button', { name: 'Add project', exact: true }).click()
     const dialog = page.getByRole('dialog', { name: 'Add a research project' })
     await dialog.getByLabel('Project name').fill('Browser validation project')
@@ -206,6 +232,38 @@ test.describe.serial('Research Monitor production browser journeys', () => {
     await expect(dialog.getByText('Use an absolute Linux path.')).toBeVisible()
     await page.keyboard.press('Escape')
     await expect(dialog).toBeHidden()
+  })
+
+  test('issues a server-bound guided prompt without scanning or changing project semantics', async ({ page }, testInfo) => {
+    const { fixtureRoot } = metadata(testInfo.config.metadata)
+    const root = path.join(fixtureRoot, 'guided-intent-project')
+    await fs.mkdir(root, { recursive: true })
+    const projectId = await enroll(page, 'Guided intent study', root)
+    const client = await agentClient(testInfo)
+    try {
+      const before = await snapshot(client, projectId)
+      await page.getByRole('button', { name: 'Ask Codex' }).click()
+      const dialog = page.getByRole('dialog', { name: 'Ask Codex' })
+      await expect(dialog.getByRole('radio', { name: /Initialize structure/i })).toBeChecked()
+      await expect(dialog.getByText(/Companion skill:/i)).toBeVisible()
+      await dialog.getByRole('button', { name: 'Generate prompt' }).click()
+      await expect(dialog.getByText('Bound request', { exact: true })).toBeVisible()
+      await expect(dialog.getByLabel('Complete generated Codex prompt')).toHaveValue(new RegExp(`agent context --project ${projectId} --intent [0-9a-f-]+ --json`))
+      await expect(dialog.getByText(/Copying sends nothing/i)).toBeVisible()
+      await expectNoA11yViolations(page, 'Ask Codex')
+      const after = await snapshot(client, projectId)
+      expect(after.project.semantic_revision).toBe(before.project.semantic_revision)
+
+      await dialog.getByRole('button', { name: 'Close', exact: true }).click()
+      await openView(page, 'Outline')
+      await createPipeline(page, 'Guided browser workflow')
+      await createTask(page, 'Guided browser task', 'GUIDED-01')
+      for (const modeName of ['Expand a task', 'Reconcile progress', 'Suggest next work', 'Record an update', 'Link artifacts']) {
+        await issueGuidedPrompt(page, modeName)
+      }
+    } finally {
+      await client.dispose()
+    }
   })
 
   test('records a complete manual research lifecycle and preserves it across recovery', async ({ page }, testInfo) => {
@@ -222,6 +280,7 @@ test.describe.serial('Research Monitor production browser journeys', () => {
     await createTask(page, 'Download dataset', 'DATA-02', 'Collect data')
     await createTask(page, 'Verify checksum', 'DATA-03', 'Download dataset')
     await createTask(page, 'Analyze results', 'ANALYSIS-01')
+    await expectNoA11yViolations(page, 'Outline')
 
     await taskRow(page, 'Analyze results').getByRole('button', { name: 'Actions for Analyze results' }).click()
     let taskMenu = page.getByRole('menu', { name: 'Actions for Analyze results' })
@@ -249,6 +308,7 @@ test.describe.serial('Research Monitor production browser journeys', () => {
     await expect(page.getByRole('button', { name: 'View 1 subtask for Collect data' })).toBeVisible()
     await expect(page.getByRole('button', { name: 'Select Analyze results' })).toBeVisible()
     await expect(page.getByRole('button', { name: 'Select Download dataset' })).toHaveCount(0)
+    await expectNoA11yViolations(page, 'Graph')
 
     await collectNode.hover()
     const subtaskPreview = page.getByRole('dialog', { name: 'Subtasks for Collect data' })
@@ -361,6 +421,7 @@ test.describe.serial('Research Monitor production browser journeys', () => {
     await expect(taskRow(page, 'Analyze results')).toBeVisible()
 
     await openView(page, 'Settings')
+    await expectNoA11yViolations(page, 'Settings')
     const lifecycle = page.locator('.settings-section').filter({ has: page.getByRole('heading', { name: 'Project lifecycle' }) })
     await lifecycle.getByRole('button', { name: 'Archive' }).click()
     await page.goto('/?show=archived')
@@ -411,8 +472,10 @@ test.describe.serial('Research Monitor production browser journeys', () => {
       await openView(page, 'Proposals')
       let card = page.locator('article.proposal-card').filter({ hasText: 'Draft the documented experiment task' })
       await expect(card).toContainText('Codex browser journey')
+      await card.getByRole('button', { name: 'Review proposal' }).click()
       await expect(card.getByText('Experiments', { exact: true })).toBeVisible()
       await expect(card.getByRole('button', { name: 'Edit task Agent drafted task' })).toBeVisible()
+      await expectNoA11yViolations(page, 'Proposal review')
 
       await card.getByRole('tab', { name: 'Operation audit' }).click()
       const initialApproval = card.getByRole('checkbox', { name: 'Select Agent drafted task (Task Create)' })
@@ -432,9 +495,11 @@ test.describe.serial('Research Monitor production browser journeys', () => {
       await expect(card.getByText('You have unsaved staging edits.')).toBeVisible()
       await expect(card.getByRole('button', { name: 'Save draft before applying' })).toBeDisabled()
       await card.getByRole('button', { name: 'Save reviewed draft' }).click()
+      await page.getByRole('button', { name: 'Review proposal' }).click()
 
       card = page.locator('article.proposal-card').filter({ has: page.getByText('Human-reviewed replacement draft.', { exact: true }) })
       await expect(card).toContainText(created.id)
+      await page.getByRole('button', { name: 'View details' }).click()
       const supersededCard = page.locator('article.proposal-card').filter({ has: page.getByText('This draft was superseded without changing its recorded operations.', { exact: true }) })
       await expect(supersededCard.getByText('Superseded', { exact: true })).toBeVisible()
 
@@ -446,6 +511,10 @@ test.describe.serial('Research Monitor production browser journeys', () => {
       const reviewedApply = card.getByRole('button', { name: /Apply \d+ selected/ })
       await expect(reviewedApply).toBeEnabled()
       await reviewedApply.click()
+      let applyDialog = page.getByRole('dialog', { name: 'Apply selected proposal changes' })
+      await expect(applyDialog.getByText('Application is atomic.')).toBeVisible()
+      await applyDialog.getByRole('button', { name: /Apply \d+ selected/ }).click()
+      card = page.locator('article.proposal-card').filter({ has: page.getByText('Applied', { exact: true }) })
       await expect(card.getByText('Applied', { exact: true })).toBeVisible()
       await openView(page, 'Outline')
       await expect(taskRow(page, 'Agent drafted task')).toBeVisible()
@@ -467,6 +536,7 @@ test.describe.serial('Research Monitor production browser journeys', () => {
 
       await openView(page, 'Proposals')
       card = page.locator('article.proposal-card').filter({ hasText: 'Rename the experiment pipeline from stale evidence' })
+      await card.getByRole('button', { name: 'Review proposal' }).click()
       await expect(card.getByText('This proposal is stale and cannot be applied.')).toBeVisible()
       await expect(card.getByRole('button', { name: 'Regeneration required' })).toBeDisabled()
       const staleApply = await client.post(`/api/v1/projects/${projectId}/proposals/${stale.id}/apply`, {
@@ -484,6 +554,7 @@ test.describe.serial('Research Monitor production browser journeys', () => {
       ])
       await page.reload()
       card = page.locator('article.proposal-card').filter({ hasText: 'Regenerate the pipeline update against current monitor state' })
+      await card.getByRole('button', { name: 'Review proposal' }).click()
       await expect(card.getByText('This proposal is stale and cannot be applied.')).toHaveCount(0)
       await card.getByRole('tab', { name: 'Operation audit' }).click()
       const regeneratedApproval = card.getByRole('checkbox', { name: 'Select Experiments — agent reconciled (Pipeline Update)' })
@@ -493,6 +564,8 @@ test.describe.serial('Research Monitor production browser journeys', () => {
       const regeneratedApply = card.getByRole('button', { name: `Apply ${regenerated.operations.length} selected` })
       await expect(regeneratedApply).toBeEnabled()
       await regeneratedApply.click()
+      applyDialog = page.getByRole('dialog', { name: 'Apply selected proposal changes' })
+      await applyDialog.getByRole('button', { name: `Apply ${regenerated.operations.length} selected` }).click()
       await expect(card.getByText('Applied', { exact: true })).toBeVisible()
       await openView(page, 'Outline')
       await expect(page.getByRole('heading', { name: 'Experiments — agent reconciled' })).toBeVisible()
@@ -528,6 +601,7 @@ test.describe.serial('Research Monitor production browser journeys', () => {
 
       await openView(page, 'Proposals')
       let card = page.locator('article.proposal-card').filter({ hasText: 'Draft for concurrent graphical review' })
+      await card.getByRole('button', { name: 'Review proposal' }).click()
       await card.getByRole('button', { name: 'Edit task Agent concurrency task' }).click()
       const editor = page.getByRole('dialog', { name: 'Edit proposed task' })
       await editor.getByLabel('Task title').fill('Page A recovered title')
@@ -541,6 +615,7 @@ test.describe.serial('Research Monitor production browser journeys', () => {
       await openView(page, 'Outline')
       await openView(page, 'Proposals')
       card = page.locator('article.proposal-card').filter({ hasText: 'Draft for concurrent graphical review' })
+      await card.getByRole('button', { name: 'Review proposal' }).click()
       await expect(card.getByRole('button', { name: 'Edit task Page A recovered title' })).toBeVisible()
       await expect(card.getByText('You have unsaved staging edits.')).toBeVisible()
 
@@ -562,6 +637,8 @@ test.describe.serial('Research Monitor production browser journeys', () => {
       await rejectedOutboxReplay
 
       // No reload: the persistent outbox invalidates the live proposal query.
+      card = page.locator('article.proposal-card').filter({ hasText: 'Draft for concurrent graphical review' })
+      await card.getByRole('button', { name: 'View details' }).click()
       await expect(card.getByText('Recovered staged edits conflict with a closed proposal.')).toBeVisible()
       await expect(card.getByText('Recovered edits · read-only')).toBeVisible()
       await card.getByRole('tab', { name: 'Proposed outline' }).click()

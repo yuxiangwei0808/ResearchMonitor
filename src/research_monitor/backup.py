@@ -10,6 +10,7 @@ from pathlib import Path
 from . import SCHEMA_VERSION
 from .database import Database
 from .service import DomainError
+from .schema_validation import validate_v0004_rollback_schema
 from .sqlite_backup import (
     SQLiteBackupIntegrityError,
     create_verified_sqlite_backup,
@@ -187,8 +188,18 @@ def create_backup(
 
 
 def restore_backup(
-    database: Database, source: Path, *, confirm: bool = False
+    database: Database,
+    source: Path,
+    *,
+    confirm: bool = False,
+    preserve_revision: str | None = None,
 ) -> dict[str, object]:
+    if preserve_revision not in {None, "0004"}:
+        raise DomainError(
+            422,
+            "unsupported_restore_revision",
+            "Only released revision 0004 can be preserved for v0.1 rollback",
+        )
     if not confirm:
         raise DomainError(422, "confirmation_required", "Restore requires explicit confirmation")
     if database.path.exists() and not database.path.is_file():
@@ -223,10 +234,16 @@ def restore_backup(
     _sqlite_backup_file(source, temporary)
     temporary.chmod(0o600)
 
-    # Initialize and validate an isolated copy before touching the live file.
+    # Validate an isolated copy before touching the live file. A rollback
+    # restore deliberately does not initialize with current code because that
+    # would immediately migrate the pre-v0.2 schema again.
     candidate = Database(temporary)
     try:
-        candidate.initialize()
+        if preserve_revision == "0004":
+            with candidate.engine.connect() as connection:
+                validate_v0004_rollback_schema(connection)
+        else:
+            candidate.initialize()
         if candidate.integrity_check() != "ok":
             raise DomainError(422, "invalid_backup", "Restored copy failed integrity check")
     except Exception as exc:
@@ -292,7 +309,11 @@ def restore_backup(
         for suffix in SQLITE_FILE_SUFFIXES[1:]:
             Path(f"{temporary}{suffix}").unlink(missing_ok=True)
         fsync_directory(database.path.parent)
-        database.initialize()
+        if preserve_revision == "0004":
+            with database.engine.connect() as connection:
+                validate_v0004_rollback_schema(connection)
+        else:
+            database.initialize()
         if database.integrity_check() != "ok":
             raise DomainError(
                 500,
@@ -302,6 +323,8 @@ def restore_backup(
         return {
             "restored_from": str(source),
             "integrity": "ok",
+            "preserved_revision": preserve_revision,
+            "requires_reinstall_before_restart": preserve_revision == "0004",
             "verified_pre_restore_backup": (
                 str(recovery_backup) if recovery_backup is not None else None
             ),

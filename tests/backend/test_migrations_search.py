@@ -28,6 +28,86 @@ from .test_api import op
 
 
 SOURCE_IDENTITY = ("project_id", "source_path", "anchor", "opaque_key")
+SOURCE_IDENTITY_V2 = (
+    "project_id",
+    "source_root_id",
+    "source_path",
+    "anchor",
+    "opaque_key",
+)
+
+
+def _insert_v0001_project_with_tasks(
+    connection,
+    *,
+    project_id: str,
+    pipeline_id: str,
+    root_path: Path,
+    tasks: list[tuple[str, str, str]],
+) -> None:
+    now = datetime.now(timezone.utc)
+    connection.execute(
+        V0001_METADATA.tables["projects"].insert(),
+        {
+            "id": project_id,
+            "name": "Legacy project",
+            "root_path": str(root_path),
+            "description": "",
+            "research_goal": "",
+            "success_criteria": "",
+            "color": "#4f46e5",
+            "semantic_revision": 0,
+            "layout_revision": 0,
+            "entity_version": 1,
+            "created_at": now,
+            "updated_at": now,
+        },
+    )
+    connection.execute(
+        V0001_METADATA.tables["pipelines"].insert(),
+        {
+            "id": pipeline_id,
+            "project_id": project_id,
+            "title": "Legacy pipeline",
+            "description": "",
+            "flow_mode": "sequential",
+            "order_index": 0.0,
+            "entity_version": 1,
+            "created_at": now,
+            "updated_at": now,
+        },
+    )
+    connection.execute(
+        V0001_METADATA.tables["tasks"].insert(),
+        [
+            {
+                "id": task_id,
+                "project_id": project_id,
+                "pipeline_id": pipeline_id,
+                "user_key": user_key,
+                "kind": "task",
+                "title": title,
+                "description": "",
+                "status": "planned",
+                "outcome": "not_applicable",
+                "priority": "recommended",
+                "labels_json": "[]",
+                "order_index": float(index),
+                "completion_criteria": "",
+                "blocker_reason": "",
+                "completion_summary": "",
+                "completion_actor": "",
+                "completion_source": "",
+                "completion_override_reason": "",
+                "completion_provenance": "",
+                "child_flow_mode": "freeform",
+                "entity_version": 1,
+                "created_at": now,
+                "updated_at": now,
+            }
+            for index, (task_id, user_key, title) in enumerate(tasks)
+        ],
+    )
 
 
 def _replace_source_references_without_full_identity(connection) -> None:
@@ -62,7 +142,7 @@ def test_fresh_database_is_at_alembic_head_with_fts(database: Database) -> None:
                 "WHERE name = 'fts5'"
             )
         )
-    assert revision == "0004"
+    assert revision == "0005"
     assert "research_search" in tables
     assert fts5 == 1
     assert not list((database.path.parent / "backups").glob("pre-migration-*.db"))
@@ -211,7 +291,7 @@ def test_revision_0001_rebuilds_owned_fts_and_replaces_reserved_triggers(
         "rm_search_artifact_ad",
     }
     with migrated.engine.connect() as connection:
-        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0004"
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0005"
         ddl = connection.scalar(
             text(
                 "SELECT sql FROM sqlite_master "
@@ -384,7 +464,7 @@ def test_legacy_create_all_database_is_backed_up_adopted_and_backfilled(
 
     migrated = Database(path)
     migrated.initialize()
-    backups = list((tmp_path / "backups").glob("pre-migration-*-0001.db"))
+    backups = list((tmp_path / "backups").glob("pre-migration-*-0005.db"))
     assert len(backups) == 1
     backup_connection = sqlite3.connect(backups[0])
     try:
@@ -401,7 +481,7 @@ def test_legacy_create_all_database_is_backed_up_adopted_and_backfilled(
         backup_connection.close()
 
     with migrated.engine.connect() as connection:
-        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0004"
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0005"
         indexed = connection.scalar(
             text(
                 "SELECT count(*) FROM research_search "
@@ -514,7 +594,7 @@ def test_frozen_revision_0001_upgrades_to_head_without_losing_data(tmp_path: Pat
             {"task_id": task_id},
         )
 
-    assert revision == "0004"
+    assert revision == "0005"
     assert "graph_viewports" in tables
     assert dict(row) == {
         "title": "Preserve quasar evidence",
@@ -529,7 +609,7 @@ def test_frozen_revision_0001_upgrades_to_head_without_losing_data(tmp_path: Pat
         assert "deletion_batch_id" in {item["name"] for item in inspector.get_columns("tasks")}
         assert "disabled_batch_id" in {item["name"] for item in inspector.get_columns("task_edges")}
         assert "validation_warning" in {item["name"] for item in inspector.get_columns("artifacts")}
-    for revision_id in ("0002", "0003", "0004"):
+    for revision_id in ("0002", "0003", "0004", "0005"):
         backups = list((tmp_path / "backups").glob(f"pre-migration-*-{revision_id}.db"))
         assert len(backups) == 1
         assert upgraded.integrity_check(backups[0]) == "ok"
@@ -541,42 +621,27 @@ def test_pre_v1_identity_columns_are_repaired_once_without_losing_rows(
 ) -> None:
     path = tmp_path / "pre-v1-identities.db"
     legacy = Database(path)
-    Base.metadata.create_all(legacy.engine)
+    V0001_METADATA.create_all(legacy.engine)
     project_id, pipeline_id, source_task_id, target_task_id, edge_id = (
         str(uuid4()) for _ in range(5)
     )
     reference_a_id = "00000000-0000-0000-0000-000000000001"
     reference_b_id = "00000000-0000-0000-0000-000000000002"
     now = datetime.now(timezone.utc)
-    with legacy.Session.begin() as session:
-        session.add(SchemaVersion(version=1))
-        session.add(Project(id=project_id, name="Pre-v1 project", root_path=str(tmp_path)))
-        session.flush()
-        session.add(
-            Pipeline(
-                id=pipeline_id,
-                project_id=project_id,
-                title="Pre-v1 pipeline",
-            )
+    with legacy.engine.begin() as connection:
+        connection.execute(
+            V0001_METADATA.tables["schema_versions"].insert(),
+            {"version": 1, "applied_at": now},
         )
-        session.flush()
-        session.add_all(
-            [
-                Task(
-                    id=source_task_id,
-                    project_id=project_id,
-                    pipeline_id=pipeline_id,
-                    user_key="LEGACY-1",
-                    title="Legacy source task",
-                ),
-                Task(
-                    id=target_task_id,
-                    project_id=project_id,
-                    pipeline_id=pipeline_id,
-                    user_key="LEGACY-2",
-                    title="Legacy target task",
-                ),
-            ]
+        _insert_v0001_project_with_tasks(
+            connection,
+            project_id=project_id,
+            pipeline_id=pipeline_id,
+            root_path=tmp_path,
+            tasks=[
+                (source_task_id, "LEGACY-1", "Legacy source task"),
+                (target_task_id, "LEGACY-2", "Legacy target task"),
+            ],
         )
 
     # Reproduce the released pre-v1 create-all shapes exactly: the source table
@@ -679,13 +744,21 @@ def test_pre_v1_identity_columns_are_repaired_once_without_losing_rows(
 
     with migrated.engine.connect() as connection:
         inspector = inspect(connection)
-        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0004"
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0005"
         assert "opaque_key" in {
             column["name"] for column in inspector.get_columns("source_references")
         }
         assert "disabled_reason" in {
             column["name"] for column in inspector.get_columns("task_edges")
         }
+        project_root_id = connection.scalar(
+            text(
+                "SELECT id FROM artifact_roots "
+                "WHERE project_id=:project_id AND is_project_root=1"
+            ),
+            {"project_id": project_id},
+        )
+        assert project_root_id is not None
         references = connection.execute(
             text(
                 "SELECT id, task_id, source_path, anchor, opaque_key, fingerprint "
@@ -736,7 +809,7 @@ def test_pre_v1_identity_columns_are_repaired_once_without_losing_rows(
             for item in inspector.get_indexes("source_references")
             if item.get("unique")
         }
-        assert ("project_id", "source_path", "anchor", "opaque_key") in unique_shapes
+        assert SOURCE_IDENTITY_V2 in unique_shapes
         assert connection.execute(text("PRAGMA foreign_key_check")).fetchall() == []
 
     backups_before_retry = sorted((tmp_path / "backups").glob("pre-migration-*.db"))
@@ -747,14 +820,17 @@ def test_pre_v1_identity_columns_are_repaired_once_without_losing_rows(
         connection.execute(
             text(
                 "INSERT INTO source_references "
-                "(id, project_id, task_id, source_path, anchor, opaque_key, fingerprint, imported_at) "
-                "VALUES (:id, :project_id, :task_id, 'PLAN.md', 'shared-anchor', "
+                "(id, project_id, task_id, source_root_id, source_path, anchor, "
+                "opaque_key, fingerprint, imported_at) "
+                "VALUES (:id, :project_id, :task_id, :source_root_id, "
+                "'PLAN.md', 'shared-anchor', "
                 "'THIRD', 'sha256:third', :now)"
             ),
             {
                 "id": str(uuid4()),
                 "project_id": project_id,
                 "task_id": target_task_id,
+                "source_root_id": project_root_id,
                 "now": now,
             },
         )
@@ -763,14 +839,17 @@ def test_pre_v1_identity_columns_are_repaired_once_without_losing_rows(
             connection.execute(
                 text(
                     "INSERT INTO source_references "
-                    "(id, project_id, task_id, source_path, anchor, opaque_key, fingerprint, imported_at) "
-                    "VALUES (:id, :project_id, :task_id, 'PLAN.md', 'shared-anchor', "
+                    "(id, project_id, task_id, source_root_id, source_path, anchor, "
+                    "opaque_key, fingerprint, imported_at) "
+                    "VALUES (:id, :project_id, :task_id, :source_root_id, "
+                    "'PLAN.md', 'shared-anchor', "
                     "'', 'sha256:duplicate', :now)"
                 ),
                 {
                     "id": str(uuid4()),
                     "project_id": project_id,
                     "task_id": source_task_id,
+                    "source_root_id": project_root_id,
                     "now": now,
                 },
             )
@@ -785,7 +864,7 @@ def test_legacy_lookalike_without_foreign_keys_is_rejected_before_repair(
 ) -> None:
     path = tmp_path / "lookalike.db"
     legacy = Database(path)
-    Base.metadata.create_all(legacy.engine)
+    V0001_METADATA.create_all(legacy.engine)
     with legacy.engine.begin() as connection:
         connection.execute(text("DROP TABLE source_references"))
         connection.execute(
@@ -834,34 +913,16 @@ def test_revision_0004_accepts_safe_partially_persisted_repair(
 ) -> None:
     path = tmp_path / "partial-0004.db"
     staged = Database(path)
-    Base.metadata.create_all(staged.engine)
+    command.upgrade(staged._alembic_config(), "0003")
     project_id, pipeline_id, task_id = (str(uuid4()) for _ in range(3))
-    with staged.Session.begin() as session:
-        session.add(
-            Project(
-                id=project_id,
-                name="Partial repair",
-                root_path=str(tmp_path),
-            )
+    with staged.engine.begin() as connection:
+        _insert_v0001_project_with_tasks(
+            connection,
+            project_id=project_id,
+            pipeline_id=pipeline_id,
+            root_path=tmp_path,
+            tasks=[(task_id, "", "Recoverable nebula index")],
         )
-        session.flush()
-        session.add(
-            Pipeline(
-                id=pipeline_id,
-                project_id=project_id,
-                title="Migration",
-            )
-        )
-        session.flush()
-        session.add(
-            Task(
-                id=task_id,
-                project_id=project_id,
-                pipeline_id=pipeline_id,
-                title="Recoverable nebula index",
-            )
-        )
-    command.stamp(staged._alembic_config(), "0003")
     with staged.engine.begin() as connection:
         connection.execute(text("DROP TABLE source_references"))
         connection.execute(text("DROP TABLE task_edges"))
@@ -919,7 +980,7 @@ def test_revision_0004_accepts_safe_partially_persisted_repair(
     migrated.initialize()
     with migrated.engine.connect() as connection:
         inspector = inspect(connection)
-        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0004"
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0005"
         assert "opaque_key" in {
             column["name"] for column in inspector.get_columns("source_references")
         }
@@ -952,11 +1013,14 @@ def test_revision_0004_accepts_safe_partially_persisted_repair(
     ],
 )
 def test_frozen_v0001_validator_fails_closed_on_structural_drift(
-    database: Database,
+    tmp_path: Path,
     table_name: str,
     fault: str,
     message: str,
 ) -> None:
+    database = Database(tmp_path / f"v0001-{table_name}-{fault}.db")
+    command.upgrade(database._alembic_config(), "0004")
+
     class FaultyInspector:
         def __init__(self, base):
             self.base = base
@@ -1000,6 +1064,7 @@ def test_frozen_v0001_validator_fails_closed_on_structural_drift(
         validate_v0001_adopted_schema(valid)
         with pytest.raises(RuntimeError, match=message):
             validate_v0001_adopted_schema(FaultyInspector(valid))
+    database.engine.dispose()
 
 
 def test_revision_0002_rejects_malformed_preexisting_graph_viewport(
@@ -1007,9 +1072,8 @@ def test_revision_0002_rejects_malformed_preexisting_graph_viewport(
 ) -> None:
     path = tmp_path / "malformed-graph.db"
     staged = Database(path)
-    Base.metadata.create_all(staged.engine)
+    command.upgrade(staged._alembic_config(), "0001")
     with staged.engine.begin() as connection:
-        connection.execute(text("DROP TABLE graph_viewports"))
         connection.execute(
             text(
                 """
@@ -1025,7 +1089,6 @@ def test_revision_0002_rejects_malformed_preexisting_graph_viewport(
                 """
             )
         )
-    command.stamp(staged._alembic_config(), "0001")
     staged.engine.dispose()
 
     rejected = Database(path)
@@ -1115,7 +1178,7 @@ def test_revision_0003_rejects_malformed_preexisting_additive_column(
 def test_unstamped_partial_0004_identity_is_completed_at_head(tmp_path: Path) -> None:
     path = tmp_path / "unstamped-partial-0004.db"
     staged = Database(path)
-    Base.metadata.create_all(staged.engine)
+    V0001_METADATA.create_all(staged.engine)
     with staged.engine.begin() as connection:
         _replace_source_references_without_full_identity(connection)
     staged.engine.dispose()
@@ -1124,8 +1187,8 @@ def test_unstamped_partial_0004_identity_is_completed_at_head(tmp_path: Path) ->
     migrated.initialize()
     with migrated.engine.connect() as connection:
         inspector = inspect(connection)
-        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0004"
-        assert SOURCE_IDENTITY in reflected_full_unique_shapes(
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0005"
+        assert SOURCE_IDENTITY_V2 in reflected_full_unique_shapes(
             inspector,
             "source_references",
         )
@@ -1154,7 +1217,7 @@ def test_unstamped_non_full_source_identity_is_rejected(
 ) -> None:
     path = tmp_path / "non-full-source-identity.db"
     staged = Database(path)
-    Base.metadata.create_all(staged.engine)
+    V0001_METADATA.create_all(staged.engine)
     with staged.engine.begin() as connection:
         _replace_source_references_without_full_identity(connection)
         connection.execute(text(index_ddl))

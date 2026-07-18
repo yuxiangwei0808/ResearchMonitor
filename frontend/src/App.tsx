@@ -1,14 +1,14 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useForm } from 'react-hook-form'
 import { Navigate, NavLink, Outlet, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { z } from 'zod'
-import { Archive, Beaker, ChevronRight, FolderPlus, LayoutDashboard, Plus, Search, Settings2, Trash2 } from 'lucide-react'
+import { Archive, Beaker, ChevronRight, FolderPlus, LayoutDashboard, Plus, Search, Settings2, Trash2, WifiOff, X } from 'lucide-react'
 import { api } from './lib/api'
 import { useOutboxReplay } from './lib/hooks'
 import { shortPath } from './lib/format'
-import type { Project } from './types'
+import type { OutboxEvent, Project } from './types'
 import { Button, Dialog, ErrorState, Field, Spinner } from './components/ui'
 import { PortfolioView } from './views/PortfolioView'
 import { ProjectWorkspace } from './views/ProjectWorkspace'
@@ -91,7 +91,7 @@ function Shell({ projects, onAdd }: { projects: Project[]; onAdd: () => void }) 
         </nav>
         {archived.length > 0 && <NavLink className="archive-link" to="/?show=archived"><Archive size={15} />{archived.length} archived</NavLink>}
         {trashed.length > 0 && <NavLink className="archive-link" to="/?show=trash"><Trash2 size={15} />{trashed.length} in trash</NavLink>}
-        <div className="sidebar-footer"><Settings2 size={14} /><span>Local only · v0.1</span></div>
+        <div className="sidebar-footer"><Settings2 size={14} /><span>Local only · v{__RESEARCH_MONITOR_VERSION__}</span></div>
       </aside>
       <main className="main-canvas"><Outlet /></main>
     </div>
@@ -110,15 +110,45 @@ function ProjectSearch({ projects, onDone }: { projects: Project[]; onDone: () =
   )
 }
 
+export function SystemBanners() {
+  const [authenticationRequired, setAuthenticationRequired] = useState(false)
+  const [transportFailures, setTransportFailures] = useState(0)
+  const [proposalEvent, setProposalEvent] = useState<OutboxEvent | null>(null)
+  useEffect(() => {
+    const authentication = () => setAuthenticationRequired(true)
+    const transportFailure = () => setTransportFailures((current) => current + 1)
+    const success = () => {
+      setTransportFailures(0)
+    }
+    const proposal = (event: Event) => setProposalEvent((event as CustomEvent<OutboxEvent>).detail)
+    window.addEventListener('research-monitor:authentication-required', authentication)
+    window.addEventListener('research-monitor:transport-failure', transportFailure)
+    window.addEventListener('research-monitor:request-success', success)
+    window.addEventListener('research-monitor:proposal-update', proposal)
+    return () => {
+      window.removeEventListener('research-monitor:authentication-required', authentication)
+      window.removeEventListener('research-monitor:transport-failure', transportFailure)
+      window.removeEventListener('research-monitor:request-success', success)
+      window.removeEventListener('research-monitor:proposal-update', proposal)
+    }
+  }, [])
+  return <>
+    {authenticationRequired && <div className="system-banner authentication-banner" role="alert"><span><strong>Re-authenticate this browser</strong><small>The local session expired or this forwarded URL has not completed browser bootstrap.</small></span><Button size="sm" onClick={() => window.location.assign(window.location.href)}>Re-authenticate browser</Button><code>research-monitor open --no-open</code></div>}
+    {!authenticationRequired && transportFailures >= 2 && <div className="system-banner disconnected-banner" role="status"><WifiOff size={18} /><span><strong>Research Monitor is disconnected</strong><small>Edits are paused while the local server restarts. This banner clears after a successful request.</small></span><code>research-monitor open --no-open</code></div>}
+    {proposalEvent && <div className="proposal-notification" role="status" aria-live="polite"><span><strong>Proposal activity recorded</strong><small>A Codex proposal is ready or changed.</small></span><a className="button button-secondary button-sm" href={`/projects/${proposalEvent.project_id}/proposals`}>Review</a><button type="button" aria-label="Dismiss proposal notification" onClick={() => setProposalEvent(null)}><X size={15} /></button></div>}
+  </>
+}
+
 export default function App() {
   useOutboxReplay()
   const [addOpen, setAddOpen] = useState(false)
   const projectsQuery = useQuery({ queryKey: ['projects'], queryFn: () => api.listProjects(true, true) })
-  if (projectsQuery.isLoading) return <div className="center-screen"><Spinner label="Opening your research workspace…" /></div>
-  if (projectsQuery.error) return <div className="center-screen"><ErrorState error={projectsQuery.error} retry={() => projectsQuery.refetch()} /></div>
+  if (projectsQuery.isLoading) return <><SystemBanners /><div className="center-screen"><Spinner label="Opening your research workspace…" /></div></>
+  if (projectsQuery.error) return <><SystemBanners /><div className="center-screen"><ErrorState error={projectsQuery.error} retry={() => projectsQuery.refetch()} /></div></>
   const projects = projectsQuery.data ?? []
   return (
     <>
+      <SystemBanners />
       <Routes>
         <Route element={<Shell projects={projects} onAdd={() => setAddOpen(true)} />}>
           <Route index element={<PortfolioView projects={projects} onAdd={() => setAddOpen(true)} />} />

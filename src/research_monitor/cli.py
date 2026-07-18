@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import secrets
-import shutil
 import sys
 import tempfile
 import threading
@@ -26,6 +24,7 @@ except ImportError:  # pragma: no cover - compatibility with older Typer release
 from . import API_VERSION, SCHEMA_VERSION, __version__
 from .backup import create_backup, restore_backup, validate_monitor_output_target
 from .config import Settings, process_start_ticks
+from .contracts import CAPABILITIES
 from .database import (
     Database,
     DatabaseCompatibilityError,
@@ -39,7 +38,12 @@ from .lifecycle import purge_project
 from .proposals import AppService
 from .schemas import ProjectCreate, ProposalEnvelope
 from .service import DomainError
-from .skill_validation import SkillBundleValidationError, validate_skill_tree
+from .skill_installation import (
+    install_skill as _install_optional_skill,
+    skill_managed_paths,
+    skill_status_value,
+    tree_hash as _tree_hash,
+)
 from .transport import RuntimeClient
 
 
@@ -49,7 +53,7 @@ agent_app = typer.Typer(help="Read-only context for coding agents")
 proposal_app = typer.Typer(help="Validate and create reviewable agent proposals")
 export_app = typer.Typer(help="Export portable monitor data")
 backup_app = typer.Typer(help="Create and restore verified SQLite backups")
-skill_app = typer.Typer(help="Install the bundled Codex companion skill")
+skill_app = typer.Typer(help="Inspect or explicitly install the optional Codex companion skill")
 app.add_typer(project_app, name="project")
 app.add_typer(agent_app, name="agent")
 app.add_typer(proposal_app, name="proposal")
@@ -70,7 +74,14 @@ def _print(value: Any) -> None:
 
 
 def _exit_for(exc: DomainError) -> int:
-    if exc.status_code == 409 and exc.code in {"revision_conflict", "entity_version_conflict"}: return 4
+    if exc.status_code == 409 and exc.code in {
+        "revision_conflict",
+        "entity_version_conflict",
+        "entity_deleted",
+        "entity_inactive",
+        "intent_stale",
+    }:
+        return 4
     if exc.code in {"project_not_found", "ambiguous_project"}: return 3
     if exc.code in {
         "schema_incompatible",
@@ -85,6 +96,7 @@ def _exit_for(exc: DomainError) -> int:
         "application_running",
         "unsafe_runtime_descriptor",
         "backup_integrity_failed",
+        "skill_install_busy",
     }:
         return 6
     return 2
@@ -124,15 +136,24 @@ def _try_data_access_locks(
     settings: Settings,
     *,
     retained_local: ApplicationLock | None = None,
+    owner_purpose: str | None = None,
 ) -> tuple[_DataAccessLocks | None, str | None, dict[str, Any]]:
     """Acquire local then shared locks, reporting which scope blocked access."""
 
-    local = retained_local or ApplicationLock(settings.lock_path)
+    local = retained_local or (
+        ApplicationLock(settings.lock_path, purpose=owner_purpose)
+        if owner_purpose is not None
+        else ApplicationLock(settings.lock_path)
+    )
     if retained_local is None and not local.acquire():
         owner = getattr(local, "owner_metadata", {})
         return None, "local", dict(owner) if isinstance(owner, dict) else {}
 
-    shared = ApplicationLock(settings.shared_lock_path)
+    shared = (
+        ApplicationLock(settings.shared_lock_path, purpose=owner_purpose)
+        if owner_purpose is not None
+        else ApplicationLock(settings.shared_lock_path)
+    )
     if not shared.acquire():
         owner = getattr(shared, "owner_metadata", {})
         local.release()
@@ -368,7 +389,16 @@ def _read_json(path: str) -> dict[str, Any]:
 @app.command("version")
 def version(json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON")) -> None:
     del json_output
-    _print(_envelope({"version": __version__, "api_version": API_VERSION, "schema_version": SCHEMA_VERSION}))
+    _print(
+        _envelope(
+            {
+                "version": __version__,
+                "api_version": API_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "capabilities": CAPABILITIES,
+            }
+        )
+    )
 
 
 @app.command("stop")
@@ -648,12 +678,19 @@ def project_purge(
 
 
 @agent_app.command("context")
-def agent_context(project: str = typer.Option(..., "--project"), json_output: bool = typer.Option(True, "--json/--no-json")) -> None:
+def agent_context(
+    project: str = typer.Option(..., "--project"),
+    intent: str | None = typer.Option(None, "--intent"),
+    json_output: bool = typer.Option(True, "--json/--no-json"),
+) -> None:
     del json_output
     def run() -> Any:
         return _coordinated(
-            lambda _database, service, session: service.agent_context(session, project),
+            lambda _database, service, session: service.agent_context(
+                session, project, intent
+            ),
             method="GET", path=f"/api/v1/projects/{project}/agent-context",
+            params={"intent_id": intent} if intent else None,
         )
     _invoke(run)
 
@@ -796,7 +833,18 @@ def backup_create(
 
 
 @backup_app.command("restore")
-def backup_restore(path: Path, confirm: bool = typer.Option(False, "--confirm")) -> None:
+def backup_restore(
+    path: Path,
+    confirm: bool = typer.Option(False, "--confirm"),
+    rollback_to_v01: bool = typer.Option(
+        False,
+        "--rollback-to-v0.1",
+        help=(
+            "Restore an exact revision-0004 backup without migrating it; "
+            "reinstall v0.1 before restarting"
+        ),
+    ),
+) -> None:
     def run() -> Any:
         settings = Settings.load()
         locks = _require_stopped_data_access(
@@ -810,7 +858,12 @@ def backup_restore(path: Path, confirm: bool = typer.Option(False, "--confirm"))
             # corruption is one of the primary reasons this command exists.
             reset_database_singleton()
             database = Database(settings.database_path)
-            return restore_backup(database, path, confirm=confirm)
+            return restore_backup(
+                database,
+                path,
+                confirm=confirm,
+                preserve_revision="0004" if rollback_to_v01 else None,
+            )
         finally:
             if database is not None:
                 database.engine.dispose()
@@ -820,96 +873,129 @@ def backup_restore(path: Path, confirm: bool = typer.Option(False, "--confirm"))
     _invoke(run)
 
 
-def _skill_source() -> Path:
-    override = os.environ.get("RESEARCH_MONITOR_SKILL_SOURCE")
-    candidates = [Path(override)] if override else []
-    candidates.extend([Path(__file__).resolve().parents[2] / "skills" / "research-monitor", Path(__file__).resolve().parent / "bundled_skill"])
-    for candidate in candidates:
-        if candidate.is_dir() and (candidate / "SKILL.md").is_file(): return candidate
-    raise DomainError(404, "skill_bundle_missing", "Bundled research-monitor skill was not found")
+def _offline_skill_protected_roots(
+    settings: Settings,
+) -> tuple[tuple[str, Path], ...]:
+    """Read retained roots while the caller owns both monitor data locks."""
+    from sqlalchemy import select
+
+    from .models import ArtifactRoot, Project
+
+    if not settings.database_path.exists():
+        return ()
+    database = get_database(settings)
+    with database.session() as session:
+        projects = session.scalars(select(Project)).all()
+        artifact_roots = session.scalars(select(ArtifactRoot)).all()
+        return tuple(
+            [
+                (f"project {project.id}", Path(project.root_path))
+                for project in projects
+            ]
+            + [
+                (f"artifact root {root.id}", Path(root.root_path))
+                for root in artifact_roots
+            ]
+        )
 
 
-def _skill_destination() -> Path:
-    return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser() / "skills" / "research-monitor"
+def _skill_protected_roots() -> tuple[tuple[str, Path], ...]:
+    """Read every retained project/artifact root without reading project files."""
 
+    settings = Settings.load()
+    locks, blocked_by, owner = _try_data_access_locks(settings)
+    if locks is not None:
+        try:
+            return _offline_skill_protected_roots(settings)
+        finally:
+            locks.release()
 
-def _skill_state_path(destination: Path | None = None) -> Path:
-    target = destination or _skill_destination()
-    return target.parent / ".research-monitor-install.json"
-
-
-def _tree_hash(path: Path) -> str:
-    digest = hashlib.sha256()
-    for item in sorted(value for value in path.rglob("*") if value.is_file()):
-        digest.update(str(item.relative_to(path)).encode()); digest.update(item.read_bytes())
-    return digest.hexdigest()
-
-
-def _installed_skill_baseline(destination: Path) -> str | None:
-    try:
-        value = json.loads(_skill_state_path(destination).read_text(encoding="utf-8"))
-        baseline = str(value["installed_hash"])
-        if len(baseline) == 64 and all(character in "0123456789abcdef" for character in baseline):
-            return baseline
-    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-        pass
-    return None
-
-
-def _validate_skill_tree(path: Path) -> None:
-    try:
-        validate_skill_tree(path)
-    except SkillBundleValidationError as exc:
-        raise DomainError(422, "skill_validation_failed", str(exc)) from exc
+    if blocked_by == "shared":
+        raise _shared_writer_error(settings, owner)
+    client = _verified_client(settings)
+    response = client.request(
+        "GET",
+        "/api/v1/projects",
+        params={"include_archived": True, "include_trashed": True},
+    )
+    projects = response.get("projects", []) if isinstance(response, dict) else []
+    roots: list[tuple[str, Path]] = []
+    for project in projects:
+        if not isinstance(project, dict) or not project.get("id"):
+            raise DomainError(
+                503,
+                "invalid_server_response",
+                "Running server returned an invalid project-root response",
+            )
+        roots.append((f"project {project['id']}", Path(str(project["root_path"]))))
+        snapshot = client.request(
+            "GET",
+            f"/api/v1/projects/{project['id']}/snapshot",
+            params={"sections": "artifact_roots"},
+        )
+        if not isinstance(snapshot, dict):
+            raise DomainError(
+                503,
+                "invalid_server_response",
+                "Running server returned an invalid artifact-root response",
+            )
+        for root in snapshot.get("artifact_roots", []):
+            if not isinstance(root, dict) or not root.get("id"):
+                raise DomainError(
+                    503,
+                    "invalid_server_response",
+                    "Running server returned an invalid artifact-root response",
+                )
+            root_path = root.get("canonical_path") or root.get("root_path")
+            if not isinstance(root_path, str) or not root_path:
+                raise DomainError(
+                    503,
+                    "invalid_server_response",
+                    "Running server returned an invalid artifact-root path",
+                )
+            roots.append((f"artifact root {root['id']}", Path(root_path)))
+    return tuple(roots)
 
 
 @skill_app.command("status")
 def skill_status() -> None:
-    def run() -> Any:
-        source = _skill_source(); destination = _skill_destination()
-        source_hash = _tree_hash(source)
-        installed_hash = _tree_hash(destination) if destination.is_dir() else None
-        baseline = _installed_skill_baseline(destination)
-        modified = bool(installed_hash and installed_hash != (baseline or source_hash))
-        return {"installed": destination.is_dir(), "modified": modified, "update_available": bool(installed_hash and installed_hash != source_hash), "source_hash": source_hash, "installed_hash": installed_hash, "baseline_hash": baseline, "path": str(destination)}
-    _invoke(run)
+    _invoke(lambda: skill_status_value(_skill_protected_roots()))
 
 
-def _install_skill(force: bool) -> dict[str, Any]:
-    source = _skill_source(); destination = _skill_destination(); destination.parent.mkdir(parents=True, exist_ok=True)
-    source_hash = _tree_hash(source)
-    installed_hash = _tree_hash(destination) if destination.exists() else None
-    baseline = _installed_skill_baseline(destination)
-    modified = bool(installed_hash and installed_hash != (baseline or source_hash))
-    if modified and not force: raise DomainError(409, "skill_modified", "Installed skill has local modifications; rerun with --force to back it up and replace it")
-    staging_root = Path(tempfile.mkdtemp(prefix="research-monitor-skill-", dir=destination.parent))
-    staging = staging_root / "research-monitor"
-    backup = None
+def _install_skill(force: bool) -> dict[str, object]:
+    settings = Settings.load()
+    locks, blocked_by, owner = _try_data_access_locks(
+        settings, owner_purpose="skill_install"
+    )
+    if locks is None:
+        if owner.get("purpose") == "skill_install":
+            raise DomainError(
+                409,
+                "skill_install_busy",
+                "Another Research Monitor skill install or update is already running",
+                {
+                    "lock_path": str(skill_managed_paths().lock),
+                    "owner": owner,
+                },
+            )
+        if blocked_by == "shared":
+            raise _shared_writer_error(settings, owner)
+        raise DomainError(
+            409,
+            "application_running",
+            (
+                "Stop Research Monitor before installing or updating the optional "
+                "Codex skill"
+            ),
+        )
     try:
-        shutil.copytree(source, staging)
-        _validate_skill_tree(staging)
-        if destination.exists() and modified:
-            backup = destination.with_name(f"research-monitor.backup-{installed_hash[:10]}")
-            if backup.exists(): shutil.rmtree(backup)
-            shutil.copytree(destination, backup)
-        previous = destination.with_name("research-monitor.previous")
-        if previous.exists(): shutil.rmtree(previous)
-        state_path = _skill_state_path(destination)
-        staged_state = staging_root / "install-state.json"
-        staged_state.write_text(json.dumps({"installed_hash": source_hash, "schema_version": 1}) + "\n", encoding="utf-8")
-        staged_state.chmod(0o600)
-        if destination.exists(): os.replace(destination, previous)
-        try:
-            os.replace(staging, destination)
-            os.replace(staged_state, state_path)
-        except Exception:
-            if destination.exists(): shutil.rmtree(destination)
-            if previous.exists(): os.replace(previous, destination)
-            raise
-        if previous.exists(): shutil.rmtree(previous)
-        return {"path": str(destination), "hash": _tree_hash(destination), "backup": str(backup) if backup else None, "modified_install_replaced": modified}
+        # Hold both host-local and shared data locks from the retained-root read
+        # through the final atomic filesystem replacement. No project or
+        # artifact-root enrollment can race the overlap decision.
+        roots = _offline_skill_protected_roots(settings)
+        return _install_optional_skill(force, roots)
     finally:
-        shutil.rmtree(staging_root, ignore_errors=True)
+        locks.release()
 
 
 @skill_app.command("install")

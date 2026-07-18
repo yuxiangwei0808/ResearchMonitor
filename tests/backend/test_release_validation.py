@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import io
 import shutil
+import tarfile
 from pathlib import Path
 
 import pytest
 
 from research_monitor.release_validation import (
     copy_verified_tree,
+    rewrite_reproducible_sdist,
     tree_manifest,
     validate_frontend_tree,
 )
@@ -125,3 +128,57 @@ def test_verified_copy_removes_stale_destination_assets(tmp_path: Path) -> None:
     copy_verified_tree(source, destination)
     assert tree_manifest(destination) == tree_manifest(source)
     assert not (destination / "stale.js").exists()
+
+
+def test_sdist_rewrite_canonicalizes_tar_and_gzip_metadata(tmp_path: Path) -> None:
+    archives = [tmp_path / "first.tar.gz", tmp_path / "second.tar.gz"]
+    for index, archive_path in enumerate(archives):
+        with tarfile.open(archive_path, mode="w:gz") as archive:
+            directory = tarfile.TarInfo("research_monitor-0.2.0")
+            directory.type = tarfile.DIRTYPE
+            directory.mode = 0o2700
+            directory.mtime = 100 + index
+            directory.uid = 1000 + index
+            directory.gid = 2000 + index
+            directory.uname = f"builder-{index}"
+            directory.gname = f"group-{index}"
+            archive.addfile(directory)
+            payload = b"stable source payload\n"
+            member = tarfile.TarInfo("research_monitor-0.2.0/README.md")
+            member.mode = 0o600
+            member.mtime = 300 + index
+            member.uid = 1000 + index
+            member.gid = 2000 + index
+            member.uname = f"builder-{index}"
+            member.gname = f"group-{index}"
+            member.size = len(payload)
+            archive.addfile(member, io.BytesIO(payload))
+
+    epoch = 1_767_225_600
+    for archive_path in archives:
+        rewrite_reproducible_sdist(archive_path, epoch)
+
+    assert archives[0].read_bytes() == archives[1].read_bytes()
+    with tarfile.open(archives[0], mode="r:gz") as archive:
+        members = archive.getmembers()
+        assert [member.name for member in members] == sorted(member.name for member in members)
+        assert all(member.mtime == epoch for member in members)
+        assert all(member.uid == member.gid == 0 for member in members)
+        assert all(member.uname == member.gname == "" for member in members)
+        assert members[0].mode == 0o755
+        assert members[1].mode == 0o644
+        assert archive.extractfile(members[1]).read() == b"stable source payload\n"
+
+
+@pytest.mark.parametrize(("name", "entry_type"), [("../escape", tarfile.REGTYPE), ("linked", tarfile.SYMTYPE)])
+def test_sdist_rewrite_rejects_unsafe_or_linked_members(
+    tmp_path: Path, name: str, entry_type: bytes
+) -> None:
+    archive_path = tmp_path / "unsafe.tar.gz"
+    with tarfile.open(archive_path, mode="w:gz") as archive:
+        member = tarfile.TarInfo(name)
+        member.type = entry_type
+        member.linkname = "outside" if entry_type == tarfile.SYMTYPE else ""
+        archive.addfile(member, io.BytesIO(b"") if entry_type == tarfile.REGTYPE else None)
+    with pytest.raises(RuntimeError, match="unsafe archive path|unsupported special entry"):
+        rewrite_reproducible_sdist(archive_path, 1_767_225_600)

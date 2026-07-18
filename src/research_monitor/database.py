@@ -16,8 +16,16 @@ from sqlalchemy.orm import Session, sessionmaker
 from . import SCHEMA_VERSION
 from .config import Settings
 from .migrations.fts_v0001 import SEARCH_TRIGGER_NAMES, SEARCH_TRIGGER_SQL
+from .migrations.schema_v0001 import validate_v0001_adopted_schema
+from .migrations.schema_v0002 import validate_v0002_graph_viewports
+from .migrations.schema_v0005 import (
+    has_any_v0005_storage,
+    project_v0004_inspector,
+    validate_v0005_schema,
+)
 from .models import SchemaVersion
 from .schema_validation import (
+    rebuild_current_search_index,
     validate_current_schema,
     validate_trigger_definitions,
 )
@@ -256,6 +264,22 @@ class Database:
                 str(exc) or type(exc).__name__,
             ) from exc
 
+
+    @staticmethod
+    def _validate_current_relational_schema(connection: Connection) -> None:
+        inspector = inspect(connection)
+        validate_v0001_adopted_schema(
+            project_v0004_inspector(inspector),
+            require_known_additive_columns=True,
+        )
+        validate_v0002_graph_viewports(inspector, required=True)
+        validate_v0005_schema(inspector, require_complete=True)
+        violations = connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise RuntimeError(
+                "Current create_all adoption found foreign-key violations"
+            )
+
     def _validate_current_schema(self) -> None:
         try:
             with self.engine.connect() as connection:
@@ -349,6 +373,48 @@ class Database:
             validate_expected_bodies=current == head,
         )
         durable_journal_enabled = False
+        adopt_unstamped_current = False
+        if current is None and database_preexisted:
+            with self.engine.connect() as connection:
+                inspector = inspect(connection)
+                if has_any_v0005_storage(inspector):
+                    self._validate_current_relational_schema(connection)
+                    adopt_unstamped_current = True
+
+        if adopt_unstamped_current:
+            # A current-ORM create_all database has the complete v0005
+            # relational shape but no Alembic history or derived FTS state.
+            # Validate it before writing, preserve it, then stamp only after the
+            # derived objects have been rebuilt inside the same transaction.
+            self._verified_pre_migration_backup(head)
+            self._enable_and_verify_durable_journal()
+            durable_journal_enabled = True
+            with self.engine.connect() as connection:
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+                self._validate_connection_triggers_before_write(
+                    connection,
+                    require_complete=False,
+                    validate_expected_bodies=False,
+                )
+                self._validate_current_relational_schema(connection)
+                config.attributes["connection"] = connection
+                try:
+                    rebuild_current_search_index(connection)
+                    command.stamp(config, head)
+                    self._validate_connection_triggers_before_write(
+                        connection,
+                        require_complete=True,
+                        validate_expected_bodies=True,
+                    )
+                except BaseException:
+                    connection.rollback()
+                    raise
+                else:
+                    connection.commit()
+                finally:
+                    config.attributes.pop("connection", None)
+            current = head
+
         if current != head:
             pending = list(scripts.iterate_revisions(head, current or "base"))
             pending.reverse()

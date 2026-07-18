@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 
 from setuptools.command.build_py import build_py
+from setuptools.command.sdist import sdist
 
 try:
     from .release_validation import (
         SkillBundleValidationError,
         copy_verified_tree,
+        rewrite_reproducible_sdist,
         validate_frontend_tree,
         validate_skill_tree,
     )
@@ -25,6 +28,7 @@ except ImportError:  # setuptools resolves cmdclass from its source file in isol
     _validation_spec.loader.exec_module(_validation)
     SkillBundleValidationError = _validation.SkillBundleValidationError
     copy_verified_tree = _validation.copy_verified_tree
+    rewrite_reproducible_sdist = _validation.rewrite_reproducible_sdist
     validate_frontend_tree = _validation.validate_frontend_tree
     validate_skill_tree = _validation.validate_skill_tree
 
@@ -54,3 +58,19 @@ class BuildPy(build_py):
             validate_skill_tree(package / "bundled_skill")
         except SkillBundleValidationError as exc:
             raise RuntimeError(f"copied research-monitor skill is invalid: {exc}") from exc
+
+
+class DeterministicSdist(sdist):
+    """Canonicalize setuptools' generated archive when an epoch is supplied."""
+
+    def run(self) -> None:
+        super().run()
+        raw_epoch = os.environ.get("SOURCE_DATE_EPOCH")
+        if raw_epoch is None:
+            return
+        try:
+            epoch = int(raw_epoch)
+        except ValueError as exc:
+            raise RuntimeError("SOURCE_DATE_EPOCH must be an integer") from exc
+        for archive in self.archive_files:
+            rewrite_reproducible_sdist(Path(archive), epoch)

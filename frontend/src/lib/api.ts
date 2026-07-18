@@ -1,13 +1,17 @@
 import type {
+  AgentPrompt,
+  AgentPromptRequest,
   AuditEvent,
   MutationOperation,
   MutationResult,
   Project,
   ProjectSnapshot,
   Proposal,
+  ProposalPage,
   ProposalOperation,
   OutboxReplay,
   SearchResponse,
+  SkillStatus,
 } from '../types'
 
 export const API_VERSION = '1'
@@ -37,7 +41,20 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const csrf = csrfToken()
   if (csrf && init.method && init.method !== 'GET') headers.set('X-CSRF-Token', csrf)
 
-  const response = await fetch(path, { ...init, headers, credentials: 'same-origin' })
+  let response: Response
+  try {
+    response = await fetch(path, { ...init, headers, credentials: 'same-origin' })
+  } catch (error) {
+    window.dispatchEvent(new CustomEvent('research-monitor:transport-failure', { detail: { path } }))
+    throw error
+  }
+  if (response.status === 401) {
+    window.dispatchEvent(new CustomEvent('research-monitor:authentication-required', { detail: { path } }))
+  } else if ([502, 503, 504].includes(response.status)) {
+    window.dispatchEvent(new CustomEvent('research-monitor:transport-failure', { detail: { path } }))
+  } else {
+    window.dispatchEvent(new CustomEvent('research-monitor:request-success', { detail: { path } }))
+  }
   if (!response.ok) {
     let body: unknown
     try {
@@ -99,6 +116,78 @@ export const api = {
   async getProposals(projectId: string): Promise<Proposal[]> {
     const value = unpack(await request<{ proposals: Proposal[] } | Proposal[]>(`/api/v1/projects/${projectId}/proposals`))
     return Array.isArray(value) ? value : value.proposals
+  },
+
+  async getProposalPage(projectId: string, options: {
+    cursor?: string
+    status?: string
+    workflowMode?: string
+    scopeType?: string
+    limit?: number
+    summary?: boolean
+  } = {}): Promise<ProposalPage> {
+    const params = new URLSearchParams()
+    if (options.cursor) params.set('cursor', options.cursor)
+    if (options.status) params.set('status', options.status)
+    if (options.workflowMode) params.set('workflow_mode', options.workflowMode)
+    if (options.scopeType) params.set('scope_type', options.scopeType)
+    params.set('limit', String(options.limit ?? 20))
+    if (options.summary !== false) params.set('summary', 'true')
+    const value = unpack(await request<ProposalPage | Proposal[] | { proposals: Proposal[] }>(`/api/v1/projects/${projectId}/proposals?${params}`))
+    if (Array.isArray(value)) return { proposals: value, next_cursor: null, total: value.length }
+    return {
+      proposals: value.proposals,
+      next_cursor: 'next_cursor' in value ? value.next_cursor : null,
+      total: 'total' in value ? value.total : value.proposals.length,
+      draft_count: 'draft_count' in value ? value.draft_count : undefined,
+      closed_count: 'closed_count' in value ? value.closed_count : undefined,
+      has_more: 'has_more' in value ? value.has_more : Boolean('next_cursor' in value && value.next_cursor),
+      status_counts: 'status_counts' in value ? value.status_counts : undefined,
+      result_kind_counts: 'result_kind_counts' in value ? value.result_kind_counts : undefined,
+      workflow_mode_counts: 'workflow_mode_counts' in value ? value.workflow_mode_counts : undefined,
+    }
+  },
+
+  async getProposal(_projectId: string, proposalId: string): Promise<Proposal> {
+    return unpack(await request<Proposal | { data: Proposal }>(`/api/v1/proposals/${proposalId}`))
+  },
+
+  async createAgentPrompt(projectId: string, input: AgentPromptRequest): Promise<AgentPrompt> {
+    const value = unpack(await request<AgentPrompt | { data: AgentPrompt }>(`/api/v1/projects/${projectId}/agent-prompts`, {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }))
+    const compatible = value as AgentPrompt & { id?: string; mode?: AgentPrompt['workflow_mode'] }
+    return {
+      ...compatible,
+      intent_id: compatible.intent_id ?? compatible.id ?? '',
+      workflow_mode: compatible.workflow_mode ?? compatible.mode ?? input.mode,
+      scope_type: compatible.scope_type ?? input.scope_type,
+      scope_id: compatible.scope_id ?? input.scope_id,
+    }
+  },
+
+  async getAgentPrompt(projectId: string, intentId: string): Promise<AgentPrompt> {
+    return unpack(await request<AgentPrompt | { data: AgentPrompt }>(`/api/v1/projects/${projectId}/agent-prompts/${intentId}`))
+  },
+
+  async getSkillStatus(): Promise<SkillStatus> {
+    const value = unpack(await request<SkillStatus | { data: SkillStatus }>('/api/v1/skill-status'))
+    const displayStatus = String(value.status || '').trim()
+    const rawStatus = String(value.normalized_status || displayStatus).trim()
+    const normalized = rawStatus.toLocaleLowerCase()
+    const status = normalized === 'installed and current' || normalized === 'current'
+      ? 'current'
+      : normalized === 'missing'
+        ? 'missing'
+        : normalized === 'modified'
+          ? 'modified'
+          : normalized === 'outdated'
+            ? 'outdated'
+            : normalized === 'blocked'
+              ? 'blocked'
+              : rawStatus
+    return { ...value, status, normalized_status: status, label: value.label ?? displayStatus }
   },
 
   async getArtifactMetadata(artifactId: string): Promise<import('../types').Artifact> {
@@ -171,6 +260,8 @@ export const api = {
       disposition: _disposition,
       before: _before,
       after: _after,
+      risk: _risk,
+      default_selected: _defaultSelected,
       ...operation
     }) => operation)
     return unpack(await request<MutationResult | { data: MutationResult }>(`/api/v1/projects/${projectId}/proposals/${proposalId}/apply`, {
@@ -184,6 +275,8 @@ export const api = {
       disposition: _disposition,
       before: _before,
       after: _after,
+      risk: _risk,
+      default_selected: _defaultSelected,
       ...operation
     }) => operation)
     return unpack(await request<Proposal | { data: Proposal }>(`/api/v1/projects/${projectId}/proposals/${proposalId}/revisions`, {

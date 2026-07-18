@@ -12,6 +12,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from research_monitor.contracts import (  # noqa: E402
     render_cli_reference_block,
+    render_evidence_reference_block,
+    render_guided_proposal_reference_block,
     render_operation_reference_block,
 )
 
@@ -44,6 +46,14 @@ def main() -> int:
         replace_block(
             references / "change-set-schema.md", "agent-operation-schemas",
             render_operation_reference_block(), check=arguments.check,
+        ),
+        replace_block(
+            references / "change-set-schema.md", "guided-proposal-contract",
+            render_guided_proposal_reference_block(), check=arguments.check,
+        ),
+        replace_block(
+            references / "change-set-schema.md", "guided-evidence-fields",
+            render_evidence_reference_block(), check=arguments.check,
         ),
     ]
     if arguments.check and not all(results):
