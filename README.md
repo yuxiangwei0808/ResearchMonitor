@@ -11,7 +11,7 @@ Research Monitor keeps its data in a central SQLite database. It never writes to
 ### What you need
 
 - A Linux host with Python 3.12 and [`uv`](https://docs.astral.sh/uv/).
-- A released `research_monitor-0.2.0-py3-none-any.whl` wheel. Get it from the project release artifacts or build it from source as described in [Development](#development).
+- A released `research_monitor-0.2.0-py3-none-any.whl` wheel. Obtain it from this project's release page, your administrator, or a locally shared release-artifact directory; `/path/to/...whl` below deliberately means that local wheel path. Contributors can build one from source as described in [Development](#development).
 - A normal web browser. When using VS Code Remote from Windows, use VS Code's **Ports** panel to open the browser on your local machine.
 
 Check the two runtime prerequisites:
@@ -26,6 +26,12 @@ Install the wheel, then confirm the command is available:
 ```bash
 uv tool install /path/to/research_monitor-0.2.0-py3-none-any.whl
 research-monitor version --json
+```
+
+If the shell says `research-monitor: command not found`, let uv add its tool-executable directory to your shell path, then open a new terminal:
+
+```bash
+uv tool update-shell
 ```
 
 To upgrade an existing installation, stop the monitor first and add `--force`:
@@ -63,12 +69,12 @@ If the browser still asks you to authenticate, first reopen the bare forwarded a
 research-monitor open --no-open
 ```
 
-It prints a one-use URL valid for 60 seconds. Treat that URL like a password and do not share it. When VS Code assigned a different local port, keep the printed `/__bootstrap/...` path but use the scheme, host, and port from VS Code's Forwarded Address.
+It prints a one-use URL valid for 60 seconds. Treat that URL like a password and do not share it. When VS Code assigned a different local port, do **not** paste the printed remote `127.0.0.1:PORT` origin into the Windows browser. Keep only its `/__bootstrap/...` path and append it to the VS Code Forwarded Address, for example `http://localhost:LOCAL_PORT/__bootstrap/...`.
 
 ### Create your first project
 
 1. On the **Portfolio** page, select **Add project**.
-2. Enter a name and an absolute **Linux** folder path, such as `/home/me/research/my-study`. Do not enter a Windows path such as `C:\Users\you\research\my-study` when the monitor runs remotely.
+2. Enter a name and an absolute **Linux** folder path, such as `/home/me/research/my-study`. Do not enter a Windows path such as `C:/Users/you/research/my-study` when the monitor runs remotely.
 3. Select **Add project**. The project starts empty on purpose.
 4. Open **Outline**, choose **Create pipeline**, then choose **Create task**. Add subtasks as needed.
 
@@ -82,6 +88,13 @@ An enrolled root must exist, be an absolute Linux directory, and be inside an al
 
 ```bash
 RESEARCH_MONITOR_ALLOWED_ROOTS=/home/me:/mnt/research research-monitor serve --port 8765
+```
+
+That form applies only to the command it prefixes. If you also use offline CLI commands in another terminal, export the value before starting the monitor (or place it in your shell profile):
+
+```bash
+export RESEARCH_MONITOR_ALLOWED_ROOTS=/home/me:/mnt/research
+research-monitor serve --port 8765
 ```
 
 ## Learn the model in two minutes
@@ -128,7 +141,7 @@ Dependencies, related edges, sequential order, and readiness remain synchronized
 
 You do **not** need Codex, an OpenAI account, or the companion skill for manual planning, editing, journals, artifacts, graph work, backups, or recovery.
 
-If you do use it, review the project scan policy in **Settings** first. Copying an **Ask Codex** prompt sends nothing. Running that prompt in Codex can send the disclosed monitor context and only the project text permitted by that scan policy to Codex/OpenAI. Every result is a proposal for your review; the agent never applies changes itself.
+If you do use it, review the project scan policy in **Settings** first. Copying an **Ask Codex** prompt sends nothing. Running that prompt asks Codex to inspect, and may send to Codex/OpenAI, the disclosed monitor context and scan-policy-permitted project text. Every result is a proposal for your review; the agent never applies changes itself.
 
 | Ask Codex mode | Use it when you want to… |
 | --- | --- |
@@ -143,7 +156,7 @@ The dashboard creates a scoped, expiring intent for the selected mode. It binds 
 
 ### Install the optional companion skill
 
-The skill is bundled for convenience but is never installed by the browser or by a normal monitor install. Check its status at any time; this command is read-only:
+The skill is bundled for convenience but is never installed by the browser or by a normal monitor install. Check its status at any time; this command does not install or replace the skill and does not modify enrolled folders:
 
 ```bash
 research-monitor skill status
@@ -159,7 +172,7 @@ research-monitor serve --port 8765
 
 Use `research-monitor skill update` only when a skill is already installed and you deliberately want to replace it. The dashboard reports **Current**, **Missing**, **Modified**, **Outdated**, or **Blocked** and shows the appropriate command. The installer refuses to use a `CODEX_HOME` that overlaps an enrolled project or approved artifact root, even with `--force`.
 
-The bundled skill is contractually instructed not to execute project code, modify research files, fetch the network, or read paths outside the approved scan policy. Research Monitor enforces what monitor data and proposal operations it accepts, but it cannot technically prevent a separate process already running as the same OS user from using unrelated filesystem or network tools. Treat the scan policy and the same-user threat boundary accordingly.
+The bundled skill is contractually instructed not to execute project code, modify research files, make project-directed or arbitrary network requests, or read paths outside the approved scan policy. Its OpenAI connection when you deliberately run Codex is separate. Research Monitor enforces what monitor data and proposal operations it accepts, but it cannot technically prevent a separate process already running as the same OS user from using unrelated filesystem or network tools. Treat the scan policy and the same-user threat boundary accordingly.
 
 The `agent context`, `proposal validate`, and `proposal create` commands are stable interfaces for Codex and other integrations. Ordinary users normally use the dashboard and the commands in this README instead.
 
@@ -237,7 +250,7 @@ This section is for contributors building from source. End users should install 
 Requirements:
 
 - Python 3.12 and `uv`
-- Node.js 24 and npm for frontend work only
+- A current Node.js and npm release for frontend work only. Node.js 24 was used for v0.2 validation.
 
 Install and test the backend:
 
@@ -269,7 +282,8 @@ npx playwright install chromium
 npm run test:e2e
 cd ..
 uv run python scripts/generate_skill_contracts.py --check
-uv run python /path/to/skill-creator/scripts/quick_validate.py skills/research-monitor
+# Set SKILL_CREATOR_ROOT if the official skill-creator checkout is elsewhere.
+uv run python "${SKILL_CREATOR_ROOT:-$HOME/.codex/skills/.system/skill-creator}/scripts/quick_validate.py" skills/research-monitor
 uv build
 ```
 

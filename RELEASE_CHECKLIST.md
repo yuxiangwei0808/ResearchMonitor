@@ -32,7 +32,8 @@ npx playwright install chromium
 npm run test:e2e
 cd ..
 uv run python scripts/generate_skill_contracts.py --check
-uv run python /path/to/skill-creator/scripts/quick_validate.py skills/research-monitor
+# Set SKILL_CREATOR_ROOT if the official skill-creator checkout is elsewhere.
+uv run python "${SKILL_CREATOR_ROOT:-$HOME/.codex/skills/.system/skill-creator}/scripts/quick_validate.py" skills/research-monitor
 ```
 
 - [ ] Backend and migration suite passed; record count and duration.
